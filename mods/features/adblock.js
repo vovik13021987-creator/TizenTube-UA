@@ -1,0 +1,2070 @@
+import { configRead } from '../config.js';
+import Chapters from '../ui/chapters.js';
+import resolveCommand from '../resolveCommand.js';
+import { timelyAction, MenuServiceItemRenderer, ShelfRenderer, TileRenderer, ButtonRenderer } from '../ui/ytUI.js';
+import { longPressData, browseTileLongPressData, tagMenuItem, applyMenuPreferences } from '../ui/longPressMenu.js';
+import { filterPlayerButtonsInResponse } from './playerButtonHider.js';
+import { noteParseCost, noteParseShape, timeFilter, playbackDiagnosticsEnabled } from './playbackHealth.js';
+import { stopAtPlaylistEnd } from './playlistEndStopper.js';
+import { stopForcedSubtitles } from './forcedSubtitleStopper.js';
+import { PatchSettings } from '../ui/customYTSettings.js';
+import { notePlaylistPage } from './playlistOwnership.js';
+import { t } from 'i18next';
+import './logServer.js';
+import { scheduleCollectAfterNativeSettles, getCachedFullPlaylist, consumeCachedFullPlaylist, noteInitialPlaylistContents, noteContinuationBatch } from './playlistBatchCollect.js';
+import {
+  appendFileOnlyLog,
+  detectAndStorePage,
+  detectPageFromResponse,
+  detectCurrentPage,
+  hideVideo,
+  processTileArraysDeep,
+  consolidateShelves,
+  clearCarryover,
+  normalizeHorizontalListRenderer,
+  normalizeGridRenderer,
+  getItemVideoId,
+  collectWatchProgressEntries,
+  updateProgressCache,
+  updateHelperHideStyle,
+} from './hideWatched.js';
+import {
+  collectAllText,
+  extractNavTabBrowseId,
+  isShortsShelf,
+  filterShortsFromItems,
+} from './shorts.js';
+import { applyLibraryTabHiding, applyLibraryShelfSpacing } from './libraryTabHider.js';
+import { filterHiddenSpecialPlaylistTiles, filterHiddenSpecialPlaylistShelves } from './specialPlaylistHider.js';
+import { filterBadgedVideos } from './badgedVideoHider.js';
+import { hideViewCountsAndBadges, stripCountsFromItems } from './viewCountHider.js';
+import { addDislikes } from './returnYoutubeDislike.js';
+import { filterByKeyword } from './keywordHider.js';
+import { filterHiddenChannels } from './channelHider.js';
+import { filterChannelShelves } from './channelShelfHider.js';
+import { filterMusicShelves } from './musicShelfHider.js';
+import { filterSurveyShelves } from './surveyHider.js';
+import { hideRelatedVideos } from './relatedVideosHider.js';
+import { dedupeShelves } from './duplicateVideoHider.js';
+import { noteVideoLength } from './playbackProgress.js';
+import { filterAggregateShelves } from './aggregateShelfHider.js';
+import { logSubscriptionsShelfShape } from './subscriptionsShelfDiag.js';
+import { addChannelSidebarButton } from './sidebarChannelButton.js';
+import {
+  isLockupVideo,
+  lockupVideoId,
+  lockupWatchEndpoint,
+  lockupTitle,
+  setLockupTitle,
+  lockupThumbnails,
+  setLockupThumbnails,
+  lockupSubtitle,
+  lockupLongPressMenuItems,
+  setLockupLongPress,
+} from './lockupViewModel.js';
+
+// ===== Local utilities =====
+
+// ===== Playlist Helper System =====
+
+function getPlaylistHelperVideoIdSet() {
+  if (!window.__ttPlaylistHelperVideoIds) window.__ttPlaylistHelperVideoIds = new Set();
+  return window.__ttPlaylistHelperVideoIds;
+}
+
+function getRetiredPlaylistHelperVideoIdSet() {
+  if (!window.__ttRetiredPlaylistHelperVideoIds) window.__ttRetiredPlaylistHelperVideoIds = new Set();
+  return window.__ttRetiredPlaylistHelperVideoIds;
+}
+
+// Updates the CSS hide rules covering active helpers AND retired helpers.
+// The virtual list re-renders retired tiles from its internal data model on every scroll,
+// so DOM removal alone causes a visible flash (tile appears → 50ms later removed → repeat).
+// CSS hiding persists across re-renders and eliminates the flash entirely.
+//
+// The two sets are passed separately rather than merged: the active helper must keep its
+// layout box to stay a valid continuation anchor, while retired helpers must NOT keep
+// theirs or they leave blank slots in the grid. See updateHelperHideStyle.
+function updateAllHelperHideStyles() {
+  updateHelperHideStyle(
+    getPlaylistHelperVideoIdSet(),
+    getRetiredPlaylistHelperVideoIdSet(),
+  );
+}
+
+function storePlaylistContinuationToken(continuations, label = '') {
+  try {
+    const token = continuations?.[0]?.nextContinuationData?.continuation
+      || continuations?.[0]?.reloadContinuationData?.continuation;
+    if (token && typeof token === 'string') {
+      window.__ttPlaylistContinuationToken = token;
+      appendFileOnlyLog('playlist.continuation.token.stored', { label, tokenLen: token.length });
+    }
+  } catch (_) {}
+}
+
+
+// Exposed on window (not exported) rather than imported directly by
+// playlistBatchCollect.js — that module must import-and-run BEFORE this
+// file (see its own top-of-file docstring: it captures native JSON.parse/
+// fetch before adblock.js patches them), so it can't safely have a
+// circular ES import back to this file. This global is only ever called
+// from an async callback long after both modules have finished loading.
+// Fires ~1.2s after a trigger claims success, to say whether it actually
+// caused anything. Previously we only knew a trigger *ran*, never whether
+// it *worked* — on-device logs showed method:"yt-continuation" firing with
+// no visible effect for up to 23 seconds afterward.
+//
+// READ THE RESULT CAREFULLY — window.__ttCurrentPlaylistItems is NOT purely
+// "what the UI has". playlistBatchCollect.js's background fetches also flow
+// through playlistContinue.js's JSON.parse hook (confirmed from bundle module
+// order — see that file's _nativeJSONParse caveat), so this count includes
+// prefetched-but-never-rendered items. Consequences when reading logs:
+//   - worked:false is trustworthy (nothing moved at all).
+//   - worked:true is NOT proof our trigger did it — a big jump right after
+//     watched-item filtering emptied the visible list is more likely YouTube
+//     refilling the viewport on its own.
+//   - beforeCount can already include background-collected items, which is
+//     why one observed run started at 21 (15 real + 6 prefetched).
+function _verifyAutoLoadEffect(reason, attempt, method, beforeCount) {
+  setTimeout(() => {
+    const afterCount = Array.isArray(window.__ttCurrentPlaylistItems) ? window.__ttCurrentPlaylistItems.length : null;
+    appendFileOnlyLog('playlist.auto_load.verify', { reason, attempt, method, beforeCount, afterCount, worked: afterCount !== null && afterCount > beforeCount });
+  }, 1200);
+}
+
+function attemptPlaylistAutoLoad(reason = 'playlist.auto_load', attempt = 0) {
+  if ((window.__ttLastDetectedPage || detectCurrentPage()) !== 'playlist') return;
+
+  const beforeCount = Array.isArray(window.__ttCurrentPlaylistItems) ? window.__ttCurrentPlaylistItems.length : 0;
+
+  // Primary: use YouTube TV's own resolveCommand with the stored continuation token.
+  // This is the most reliable trigger since it goes through the same code path as
+  // the TV's internal "load more" mechanism.
+  const token = window.__ttPlaylistContinuationToken;
+  if (token) {
+    try {
+      resolveCommand({
+        clickTrackingParams: '',
+        continuationCommand: {
+          token,
+          request: 'CONTINUATION_REQUEST_TYPE_BROWSE',
+        },
+      });
+      appendFileOnlyLog('playlist.auto_load.trigger', { reason, attempt, method: 'resolveCommand', tokenLen: token.length });
+      _verifyAutoLoadEffect(reason, attempt, 'resolveCommand', beforeCount);
+      return;
+    } catch (err) {
+      // Previously silent — every on-device attempt logged method:"yt-continuation"
+      // with no way to tell whether that's because this threw or because token
+      // was falsy. Now it's visible either way.
+      appendFileOnlyLog('playlist.auto_load.resolveCommand_error', { reason, attempt, tokenLen: token.length, err: String(err?.message || err) });
+    }
+  } else {
+    appendFileOnlyLog('playlist.auto_load.no_token', { reason, attempt });
+  }
+
+  // Fallback 1: activate the <yt-continuation> sentinel element directly.
+  // YouTube TV uses this element to detect when the user has scrolled to the bottom;
+  // clicking/activating it triggers the same continuation fetch as reaching the end.
+  try {
+    const cont = document.querySelector('ytlr-playlist-video-list-renderer yt-continuation');
+    if (cont) {
+      const method = typeof cont.activate === 'function' ? 'activate'
+        : typeof cont.click === 'function' ? 'click'
+        : 'dispatchEvent';
+      if (method === 'activate') cont.activate();
+      else if (method === 'click') cont.click();
+      else cont.dispatchEvent(new Event('activate', { bubbles: true }));
+      appendFileOnlyLog('playlist.auto_load.trigger', { reason, attempt, method: 'yt-continuation', sentinelMethod: method });
+      _verifyAutoLoadEffect(reason, attempt, 'yt-continuation', beforeCount);
+      return;
+    } else {
+      appendFileOnlyLog('playlist.auto_load.no_sentinel', { reason, attempt });
+    }
+  } catch (err) {
+    appendFileOnlyLog('playlist.auto_load.sentinel_error', { reason, attempt, err: String(err?.message || err) });
+  }
+
+  // All available triggers exhausted — nothing to do.
+  appendFileOnlyLog('playlist.auto_load.trigger', { reason, attempt, method: 'no_trigger' });
+}
+window.__ttAttemptPlaylistAutoLoad = attemptPlaylistAutoLoad;
+window.__ttResolveCommand = resolveCommand;
+
+function schedulePlaylistAutoLoad(reason = 'playlist.auto_load') {
+  if ((window.__ttLastDetectedPage || detectCurrentPage()) !== 'playlist') return;
+  const reasonText = String(reason || '');
+  const allowAutoLoad = reasonText.includes('keep-one') || reasonText.includes('empty_batch');
+  if (!allowAutoLoad) return;
+  const now = Date.now();
+  if (reasonText.includes('empty_batch')) {
+    window.__ttEmptyBatchAutoLoadCount = Number(window.__ttEmptyBatchAutoLoadCount || 0) + 1;
+    if (window.__ttEmptyBatchAutoLoadCount > 6) return;
+  } else {
+    window.__ttEmptyBatchAutoLoadCount = 0;
+  }
+  const cooldownUntil = Number(window.__ttPlaylistAutoLoadCooldownUntil || 0);
+  if (now < cooldownUntil) return;
+  window.__ttPlaylistAutoLoadCooldownUntil = now + 2600;
+  [0, 150, 500, 1000, 1800].forEach((delay, index) => setTimeout(() => {
+    attemptPlaylistAutoLoad(reason, index);
+  }, delay));
+}
+
+function showPlaylistAllHiddenNotice(reason = 'playlist.all_hidden') {
+  if (typeof document === 'undefined') return;
+  const id = 'tt-playlist-empty-notice';
+  let notice = document.getElementById(id);
+  if (!notice) {
+    notice = document.createElement('div');
+    notice.id = id;
+    Object.assign(notice.style, {
+      position: 'fixed', left: '50%', bottom: '4%', transform: 'translateX(-50%)',
+      background: 'rgba(0,0,0,0.85)', color: '#fff', padding: '12px 16px',
+      borderRadius: '10px', zIndex: '999999', fontSize: '18px'
+    });
+    document.body?.appendChild(notice);
+  }
+  notice.textContent = t('playlist.allHidden');
+  const cleanup = () => {
+    if (detectCurrentPage() === 'playlist') return;
+    document.getElementById(id)?.remove();
+    if (window.__ttPlaylistNoticeInterval) { clearInterval(window.__ttPlaylistNoticeInterval); window.__ttPlaylistNoticeInterval = null; }
+  };
+  if (!window.__ttPlaylistNoticeCleanupBound) {
+    window.__ttPlaylistNoticeCleanupBound = true;
+    window.addEventListener('hashchange', cleanup);
+    window.addEventListener('popstate', cleanup);
+  }
+  if (!window.__ttPlaylistNoticeInterval) window.__ttPlaylistNoticeInterval = setInterval(cleanup, 500);
+}
+
+function getPlaylistTileNodes() {
+  if (typeof document === 'undefined' || !document?.querySelectorAll) return [];
+  const listRoot = document.querySelector('ytlr-playlist-video-list-renderer');
+  if (!listRoot) return [];
+  return Array.from(listRoot.querySelectorAll('ytlr-tile-renderer, ytlr-grid-tile, ytlr-rich-item-renderer'));
+}
+
+function isHelperLikePlaylistNode(rowNode, tileNode) {
+  const rowClass = String(rowNode?.className || '');
+  const tileClass = String(tileNode?.className || '');
+  return rowClass.includes('fitbrf') || rowClass.includes('B3hoEd') ||
+    rowClass.includes('tt-helper-soft-hidden') || tileClass.includes('HTybHf') || tileClass.includes('IYlICe');
+}
+
+// One-shot structural dump of a tile we KNOW is a helper (matched by the
+// outerHTML substring scan, the only identification that has ever worked).
+//
+// Why this exists: cleanupPlaylistHelpersFromDom looks tiles up by
+// [data-video-id] / [video-id] / [data-content-id] / [content-id], and every
+// on-device log shows it reporting matched:0 — never 1, never skippedUnsafe,
+// just nothing found. updateHelperHideStyle builds its CSS from those same
+// four selectors, so if they match nothing then the CSS hiding is a no-op too
+// and the only thing that has ever removed a helper is the substring scan.
+// This logs what the node ACTUALLY carries so a selector that works can be
+// written instead of guessed at. Capped at a few dumps — outerHTML is large
+// and the log is chunked at 1000 chars per entry.
+const _HELPER_DUMP_MAX = 3;
+function dumpHelperTileStructure(tile, id) {
+  if (Number(window.__ttHelperDumpCount || 0) >= _HELPER_DUMP_MAX) return;
+  window.__ttHelperDumpCount = Number(window.__ttHelperDumpCount || 0) + 1;
+  try {
+    const attrsOf = (el) => {
+      if (!el || !el.attributes) return [];
+      return Array.from(el.attributes).map(a => `${a.name}=${String(a.value).slice(0, 40)}`);
+    };
+    // Find which descendant actually carries the id, and how.
+    let carrier = null;
+    try {
+      for (const el of [tile, ...Array.from(tile.querySelectorAll('*')).slice(0, 60)]) {
+        const hasInAttr = Array.from(el.attributes || []).some(a => String(a.value).includes(id));
+        if (hasInAttr) { carrier = el; break; }
+      }
+    } catch (_) {}
+    appendFileOnlyLog('playlist.helper.tile_structure', {
+      id,
+      tileTag: tile?.tagName || null,
+      tileAttrs: attrsOf(tile),
+      tileClass: String(tile?.className || '').slice(0, 200),
+      rowTag: tile?.closest?.('.TXB27d')?.tagName || null,
+      rowClass: String(tile?.closest?.('.TXB27d')?.className || '').slice(0, 200),
+      // If carrier is null the id lives only in text content or a property,
+      // not in any attribute — which would explain matched:0 outright.
+      carrierTag: carrier?.tagName || null,
+      carrierAttrs: carrier ? attrsOf(carrier) : null,
+      carrierIsTile: carrier === tile,
+    });
+  } catch (err) {
+    appendFileOnlyLog('playlist.helper.tile_structure.error', { id, err: String(err?.message || err) });
+  }
+}
+
+// NOTE: do NOT try to hide or collapse .TXB27d rows here.
+//
+// This was attempted (collapse the row left behind after removing a helper
+// tile) and confirmed on-device not to work: rowsCollapsed reported 1 and 2 on
+// real runs, yet the blank slots stayed exactly where they were and the one
+// visible helper still sat in 4th position. yt-virtual-list positions rows by
+// transform from its own layout math over its data model, so the slot a row
+// occupies is reserved whether or not the row element is displayed.
+//
+// It is also actively unsafe. The virtual list RECYCLES .TXB27d nodes — it
+// repoints an existing row at different content rather than creating a new one
+// — so any inline style we leave behind rides along to whatever video reuses
+// that node. That exact pattern (opacity:0 on helper rows) was removed in
+// 6a340fc after it produced black gaps and navigation hangs while scrolling.
+// display:none would do the same, only worse: a real video silently missing.
+//
+// The data model is the only layer that would actually work, and it is out of
+// reach: 654577e removed clearStaleHelpersFromVListData after confirming every
+// Polymer API (set/splice/notifyPath/render) is undefined on Tizen 5.0.
+
+function removeRetiredHelpersFromTiles(reason = 'playlist.helper.tile_scan') {
+  if (window.__ttRemovingHelperTiles) return { scannedTiles: 0, removed: 0, matchedIds: [] };
+  const retiredIds = Array.from(getRetiredPlaylistHelperVideoIdSet());
+  if (!retiredIds.length) return { scannedTiles: 0, removed: 0, matchedIds: [] };
+  const tiles = getPlaylistTileNodes();
+  if (!tiles.length) return { scannedTiles: 0, removed: 0, matchedIds: [] };
+  window.__ttRemovingHelperTiles = true;
+  let matchedTiles = 0, removed = 0, focusRedirected = 0, deferredNoContent = 0;
+  const removedTiles = new Set(), matchedIds = new Set();
+  try {
+    for (const tile of tiles) {
+      const html = String(tile?.outerHTML || '');
+      if (!html) continue;
+      for (const id of retiredIds) {
+        if (!id || !html.includes(id)) continue;
+        matchedIds.add(id);
+        matchedTiles++;
+        // This tile is confirmed to be a helper. Record what it actually
+        // looks like (capped) so the attribute-selector path can be fixed.
+        dumpHelperTileStructure(tile, id);
+        try {
+          // Only remove this helper tile if there are other non-retired tiles already in DOM.
+          // If it's the only tile, keeping it is critical: the virtual list needs at least one
+          // rendered element as a scroll anchor. Removing it empties the list, which causes
+          // YouTube TV to reload the whole page when yt-continuation is triggered.
+          // The MutationObserver will retry once the next batch renders a replacement tile.
+          const nonRetiredTiles = tiles.filter(t => {
+            if (t === tile) return false;
+            const h = String(t?.outerHTML || '');
+            return h && !retiredIds.some(rid => rid && h.includes(rid));
+          });
+          if (nonRetiredTiles.length === 0) { deferredNoContent++; break; }
+          const rowNode = tile.closest('.TXB27d');
+          const rowClass = String(rowNode?.className || '');
+          const isFocused = rowClass.includes('lxpVI') || rowClass.includes('zylon-focus') || tile.classList?.contains('zylon-focus');
+          if (isFocused) {
+            focusRedirected++;
+            // Redirect focus away from the removed tile.
+            // Do NOT call vlist.focus() — on Tizen 5.0 that triggers a full playlist
+            // page restart (YouTube TV re-fetches the initial response), which causes
+            // all retired IDs to be re-rendered and breaks the helper cleanup cycle.
+            try { document.body?.focus?.(); } catch (_) {}
+          }
+          if (!removedTiles.has(tile)) {
+            removedTiles.add(tile);
+            try { tile.remove(); } catch (_) {}
+            removed++;
+          }
+        } catch (_) { }
+        break;
+      }
+    }
+    // Do NOT call schedulePlaylistAutoLoad after removal.
+    // schedulePlaylistAutoLoad on an empty virtual list causes YouTube TV to reload the
+    // whole page. YouTube TV's own continuation mechanism handles loading more content.
+  } finally {
+    window.__ttRemovingHelperTiles = false;
+  }
+  appendFileOnlyLog('playlist.helper.tile_scan', { reason, retiredCount: retiredIds.length, scannedTiles: tiles.length, removed, matchedTiles, focusRedirected, deferredNoContent, matchedIds: Array.from(matchedIds) });
+  return { scannedTiles: tiles.length, removed, matchedIds: Array.from(matchedIds), matchedTiles };
+}
+
+function ensurePlaylistHelperObserver() {
+  if (window.__ttPlaylistHelperObserverInstalled) return;
+  if (typeof MutationObserver === 'undefined' || typeof document === 'undefined' || !document?.documentElement) return;
+  let debounceTimer = null, isProcessing = false;
+  const process = () => {
+    if (isProcessing) return;
+    if (detectCurrentPage() !== 'playlist') return;
+    if (getRetiredPlaylistHelperVideoIdSet().size === 0) return;
+    isProcessing = true;
+    try {
+      const result = removeRetiredHelpersFromTiles('observer.mutation');
+      if (result.removed > 0) appendFileOnlyLog('playlist.helper.observer.tick', { removed: result.removed, matchedTiles: result.matchedTiles || 0 });
+    } finally { isProcessing = false; }
+  };
+  const observer = new MutationObserver(() => {
+    if (isProcessing) return;
+    if (detectCurrentPage() !== 'playlist') return;
+    if (getRetiredPlaylistHelperVideoIdSet().size === 0) return;
+    if (debounceTimer) clearTimeout(debounceTimer);
+    // 50ms debounce: fast enough that helpers are invisible when re-rendered by the
+    // virtual list during scroll, but not so tight that we thrash on every mutation.
+    debounceTimer = setTimeout(process, 50);
+  });
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+  window.__ttPlaylistHelperObserverInstalled = true;
+}
+
+function retirePlaylistHelperVideoId(videoId, label = 'playlist.helper') {
+  const id = String(videoId || '').trim();
+  if (!id) return;
+  getRetiredPlaylistHelperVideoIdSet().add(id);
+  // CSS-hide the retired tile immediately so it stays invisible even when the virtual
+  // list re-renders it during scroll (DOM removal alone causes a flash: tile appears →
+  // observer removes → vlist re-renders → repeat). CSS persists across re-renders.
+  updateAllHelperHideStyles();
+  ensurePlaylistHelperObserver();
+  // Do NOT call removeRetiredHelpersFromTiles immediately. At retirement time the new
+  // batch content has not yet been rendered, so the helper is the only tile in DOM.
+  // Removing it immediately empties the virtual list and causes a page restart.
+  // The scheduled cleanup (300ms+) and MutationObserver handle removal once new content exists.
+}
+
+function registerPlaylistHelperVideoId(videoId, label = 'playlist.helper') {
+  const id = String(videoId || '').trim();
+  if (!id) return;
+  const set = getPlaylistHelperVideoIdSet();
+  const staleIds = Array.from(set).filter(knownId => knownId !== id);
+  if (staleIds.length > 0) {
+    schedulePlaylistHelperDomCleanup(staleIds, `${label}.register.stale`);
+    for (const staleId of staleIds) unregisterPlaylistHelperVideoId(staleId, `${label}.register.stale`);
+  }
+  set.add(id);
+  const retired = getRetiredPlaylistHelperVideoIdSet();
+  if (retired.delete(id)) appendFileOnlyLog(`${label}.register.unretire`, { videoId: id });
+  appendFileOnlyLog(`${label}.register`, { videoId: id, total: set.size });
+  updateAllHelperHideStyles();
+}
+
+function unregisterPlaylistHelperVideoId(videoId, label = 'playlist.helper') {
+  const id = String(videoId || '').trim();
+  if (!id) return;
+  const set = getPlaylistHelperVideoIdSet();
+  if (set.delete(id)) {
+    retirePlaylistHelperVideoId(id, label);
+    appendFileOnlyLog(`${label}.unregister`, { videoId: id, total: set.size });
+  }
+}
+
+function clearPlaylistHelperVideoIdSet(label = 'playlist.helper') {
+  const set = getPlaylistHelperVideoIdSet();
+  const helperIds = Array.from(set);
+  if (helperIds.length > 0) {
+    schedulePlaylistHelperDomCleanup(helperIds, `${label}.registry.cleared`);
+    for (const helperId of helperIds) retirePlaylistHelperVideoId(helperId, `${label}.registry`);
+    set.clear();
+    updateAllHelperHideStyles();
+    appendFileOnlyLog(`${label}.registry.cleared`, { cleared: helperIds.length, helperIds });
+  }
+}
+
+function cleanupPlaylistHelpersFromDom(helperIds, reason = 'playlist.helper.cleanup', attempt = 0) {
+  if (!Array.isArray(helperIds) || helperIds.length === 0) return { matched: 0, removed: 0 };
+  if (typeof document === 'undefined' || !document?.querySelectorAll) return { matched: 0, removed: 0 };
+  let matched = 0, removed = 0, skippedUnsafe = 0;
+  const removedNodes = new Set();
+  const playlistRoot = document.querySelector('ytlr-playlist-video-list-renderer') || document;
+  for (const rawId of helperIds) {
+    const id = String(rawId || '').trim();
+    if (!id) continue;
+    for (const selector of [`[data-video-id="${id}"]`, `[video-id="${id}"]`, `[data-content-id="${id}"]`, `[content-id="${id}"]`]) {
+      let nodes = [];
+      try { nodes = Array.from(playlistRoot.querySelectorAll(selector)); } catch (_) { }
+      if (!nodes.length) continue;
+      matched += nodes.length;
+      for (const node of nodes) {
+        const safeNode = node?.closest?.('ytlr-tile-renderer, ytlr-grid-tile, ytlr-rich-item-renderer') || null;
+        if (!safeNode) { skippedUnsafe++; continue; }
+        const rowNode = safeNode.closest?.('.TXB27d');
+        const rowClass = String(rowNode?.className || '');
+        const focused = rowClass.includes('lxpVI') || rowClass.includes('zylon-focus') || safeNode.classList?.contains('zylon-focus');
+        if (!isHelperLikePlaylistNode(rowNode, safeNode) || focused) { skippedUnsafe++; continue; }
+        if (removedNodes.has(safeNode)) continue;
+        try { removedNodes.add(safeNode); safeNode.remove(); removed++; } catch (_) { skippedUnsafe++; }
+      }
+    }
+  }
+  const tileScanResult = removeRetiredHelpersFromTiles(`${reason}.cleanup_attempt_${attempt}`);
+  removed += Number(tileScanResult.removed || 0);
+  appendFileOnlyLog('playlist.helper.dom.cleanup', { reason, helperIds, attempt, matched, removed, skippedUnsafe });
+  return { matched, removed };
+}
+
+function schedulePlaylistHelperDomCleanup(helperIds, reason = 'playlist.helper.cleanup') {
+  if (!Array.isArray(helperIds) || helperIds.length === 0) return;
+  // Start at 300ms: YouTube TV renders new batch content within ~100ms of JSON parse.
+  // 300ms ensures replacement content is in DOM before we attempt removal.
+  [300, 700, 1500].forEach((delay, index) => setTimeout(() => cleanupPlaylistHelpersFromDom(helperIds, reason, index), delay));
+}
+
+function clearKeepOneMarkers(items, label = 'continuation') {
+  if (!Array.isArray(items)) return 0;
+  let cleared = 0;
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue;
+    if (item.__ttKeepOneForContinuation) {
+      const helperVideoId = getItemVideoId(item);
+      delete item.__ttKeepOneForContinuation;
+      delete item.__ttKeepOneForContinuationLabel;
+      delete item.__ttKeepOneForContinuationParseSeq;
+      unregisterPlaylistHelperVideoId(helperVideoId, `${label}.keep-one`);
+      cleared++;
+    }
+  }
+  return cleared;
+}
+
+// True while playlistBatchCollect.js is fetching (or has already fetched) the
+// rest of this playlist on its own.
+//
+// When it is, the keep-one auto-load cascade below must stay out of the way.
+// Timings from a 68-video all-watched playlist show why: our cascade drove
+// YouTube through its own continuations at 17:53:01.780, .02.060 and .02.265 —
+// three helpers inside half a second, one per response — while the background
+// collector was still working and only reached prefetch_ready at 17:53:12.375,
+// ten seconds later, with all 53 items nobody needed by then. Every one of
+// those helpers is permanently stuck in the virtual list's data model, which is
+// unreachable on Tizen 5.0 (654577e), so each is a blank slot for the rest of
+// the visit.
+//
+// Standing down lets the prefetched batches arrive as ONE merged continuation.
+// That response carries no further continuation token, so hasContinuation is
+// false and the keep-one branch never runs for it — leaving exactly one helper
+// (from the initial page load) instead of four, and that one gets retired and
+// removed when the merged batch lands.
+function isBatchCollectHandlingPlaylist() {
+  try {
+    if (!configRead('enablePlaylistBatchCollect')) return false;
+    return !!(window.__ttPrefetchStarted || window.__ttPrefetchedBatch);
+  } catch (_) { return false; }
+}
+
+function filterContinuationItems(items, pageName, hasContinuation = false, label = 'continuation') {
+  if (pageName === 'playlist' && !hasContinuation) {
+    clearPlaylistHelperVideoIdSet(label);
+    // Also wipe the retired set. On Tizen 5.0 YouTube TV can "restart" a playlist page
+    // (re-fetch the initial response without a browser reload) when e.g. vlist.focus()
+    // was called. window state survives that restart, so stale retired IDs remain in the
+    // set and cause the MutationObserver to remove freshly-rendered tiles immediately,
+    // creating a deadlock where the only visible tile is perpetually deferred.
+    const retiredSet = getRetiredPlaylistHelperVideoIdSet();
+    if (retiredSet.size > 0) {
+      appendFileOnlyLog('playlist.retired.cleared_on_fresh', { count: retiredSet.size, ids: Array.from(retiredSet) });
+      retiredSet.clear();
+      updateAllHelperHideStyles();
+    }
+  }
+  clearKeepOneMarkers(items, label);
+  let filteredItems = hideVideo(items, pageName);
+  filteredItems = filterShortsFromItems(filteredItems, pageName);
+  filteredItems = filterBadgedVideos(filteredItems, pageName);
+  stripCountsFromItems(filteredItems, pageName);
+  filteredItems = filterByKeyword(filteredItems, pageName);
+  filteredItems = filterHiddenChannels(filteredItems, pageName);
+  // Every all-watched batch keeps its OWN helper. Do not try to reuse a single
+  // helper across batches and return [] for the rest — that was tried and it
+  // stops the playlist loading dead:
+  //
+  //   keep-one.register  BO7rZs_CYQs
+  //   keep-one.reused    active:["BO7rZs_CYQs"]
+  //   continuation.detected  x1   <- and nothing further, ever
+  //
+  // A 68-video playlist got two batches in and stalled showing only the helper.
+  // Confirmed deliberately: video 68 was set to 20% watched against an 80% hide
+  // threshold so it had to render, and it never appeared, because batch 5 was
+  // never fetched.
+  //
+  // YouTube's refill loop needs each continuation response to append at least
+  // one item. Hand it an empty batch and it treats the fetch as satisfied and
+  // stops asking, so the chain dies at the last non-empty response. The
+  // per-batch helper is what keeps that loop alive — the list stays starved
+  // enough to request more while still receiving something each time. The
+  // stranded blank slots are the price, and the data model that would let us
+  // clean them up is unreachable on Tizen 5.0 (654577e).
+  if (pageName === 'playlist' && hasContinuation && filteredItems.length === 0 && Array.isArray(items) && items.length > 0) {
+    const reverseItems = [...items].reverse();
+    const fallbackItem =
+      reverseItems.find(item => item?.tileRenderer?.header?.tileHeaderRenderer?.thumbnail?.thumbnails?.length) ||
+      reverseItems.find(item => item?.tileRenderer) || items[items.length - 1];
+    if (fallbackItem && typeof fallbackItem === 'object') {
+      fallbackItem.__ttKeepOneForContinuation = true;
+      fallbackItem.__ttKeepOneForContinuationLabel = `${label}.visible`;
+      fallbackItem.__ttKeepOneForContinuationParseSeq = Number(window.__ttParseSeq || 0);
+      registerPlaylistHelperVideoId(getItemVideoId(fallbackItem), `${label}.keep-one`);
+    }
+    // All items in this batch are watched — auto-fetch the next batch without waiting
+    // for the user to scroll. The continuation token is already stored at this point.
+    // This cascades through all-watched batches automatically until unwatched content appears.
+    if (isBatchCollectHandlingPlaylist()) {
+      appendFileOnlyLog(`${label}.keep-one.autoload_skipped`, { reason: 'batch_collect_active' });
+    } else {
+      schedulePlaylistAutoLoad(`${label}.keep-one`);
+    }
+    return [fallbackItem];
+  }
+  if (pageName === 'playlist' && !hasContinuation && filteredItems.length === 0) showPlaylistAllHiddenNotice(`${label}.no_continuation_all_hidden`);
+  if (pageName === 'playlist' && hasContinuation && filteredItems.length === 0) {
+    const collecting = isBatchCollectHandlingPlaylist();
+    appendFileOnlyLog(`${label}.empty_batch.autoload`, { pageName, originalCount: Array.isArray(items) ? items.length : 0, skipped: collecting });
+    if (!collecting) schedulePlaylistAutoLoad(`${label}.empty_batch`);
+  }
+  return filteredItems;
+}
+
+function filterPlaylistRendererContents(playlistRenderer, pageName, label = 'playlist.renderer') {
+  if (!playlistRenderer || !Array.isArray(playlistRenderer.contents)) return;
+  const hasContinuation = !!playlistRenderer?.continuations;
+  const before = playlistRenderer.contents.length;
+  playlistRenderer.contents = filterContinuationItems(playlistRenderer.contents, pageName, hasContinuation, label);
+  if (pageName === 'playlist' && !hasContinuation && playlistRenderer.contents.length === 0) showPlaylistAllHiddenNotice(`${label}.all_hidden_after_filter`);
+  appendFileOnlyLog(`${label}.result`, { pageName, hasContinuation, before, after: playlistRenderer.contents.length });
+}
+
+// ===== processResponsePayload (array-root responses) =====
+
+function processResponsePayload(payload, detectedPage) {
+  if (!payload || typeof payload !== 'object') return;
+
+  // Watch progress was recorded ONLY in the object-root JSON.parse branch
+  // below, never here. Reported symptom: watch two playlist items, leave the
+  // playlist and come back inside the same session, and both still show as
+  // unwatched — but restarting the app fixes it. That fits exactly: the
+  // frameworkUpdates mutation carrying the new percentage arrived as an
+  // array-root response and was dropped, so _ttVideoProgressCache — the
+  // fallback getWatchPercent() uses when a response carries no resume overlay
+  // — never learned about it. After a restart YouTube serves fresh overlays
+  // from its own server, so the fallback is not needed and it appears to work.
+  //
+  // This is the dual-path gap AGENTS.md warns about, and the same class of bug
+  // already found here for addLongPress and the grid filters.
+  noteVideoLength(payload);
+  updateProgressCache(payload);
+  if (detectedPage !== 'watch' && payload?.frameworkUpdates?.entityBatchUpdate?.mutations) {
+    if (!window._ttVideoProgressCache) window._ttVideoProgressCache = {};
+    for (const mutation of payload.frameworkUpdates.entityBatchUpdate.mutations) {
+      try {
+        for (const entry of collectWatchProgressEntries(mutation?.payload || {})) {
+          if (window._ttVideoProgressCache[entry.id] === undefined) window._ttVideoProgressCache[entry.id] = Number(entry.percent);
+        }
+      } catch (_) { }
+    }
+  }
+
+  // Confirmed missing: this array-root path never stripped ad-carrying
+  // fields at all — only the object-root JSON.parse patch below did. Any
+  // response that happens to arrive as an array root (observed: a manual
+  // home-page refresh) went through this function instead, so ads/banners
+  // in it were never blocked regardless of enableAdBlock. Same class of gap
+  // already found and fixed for addLongPress in this function.
+  const arrayAdBlockEnabled = configRead('enableAdBlock');
+  if (arrayAdBlockEnabled) {
+    if (payload.adPlacements) {
+      appendFileOnlyLog('adblock.stripped', { path: 'arrayPayload.adPlacements', detectedPage });
+      payload.adPlacements = [];
+    }
+    if (payload.playerAds) {
+      appendFileOnlyLog('adblock.stripped', { path: 'arrayPayload.playerAds', detectedPage });
+      payload.playerAds = false;
+    }
+    if (payload.adSlots) {
+      appendFileOnlyLog('adblock.stripped', { path: 'arrayPayload.adSlots', detectedPage });
+      payload.adSlots = [];
+    }
+  }
+
+  if (payload?.contents?.sectionListRenderer?.contents) {
+    const slr = payload.contents.sectionListRenderer;
+    processShelves(slr.contents, true, detectedPage);
+    timeFilter('shelves', () => consolidateShelves(slr.contents, 'arrayPayload.sectionList', detectedPage, !!slr.continuations, filterShortsFromItems));
+  }
+  addChannelSidebarButton(payload);
+  if (payload?.contents?.tvBrowseRenderer?.content?.tvSurfaceContentRenderer?.content?.sectionListRenderer?.contents) {
+    const tvBrowseSlr = payload.contents.tvBrowseRenderer.content.tvSurfaceContentRenderer.content.sectionListRenderer;
+    processShelves(tvBrowseSlr.contents, true, detectedPage);
+    timeFilter('shelves', () => consolidateShelves(tvBrowseSlr.contents, 'arrayPayload.tvBrowse.sectionList', detectedPage, !!tvBrowseSlr.continuations, filterShortsFromItems));
+  }
+  if (payload?.contents?.tvBrowseRenderer?.content?.tvSurfaceContentRenderer?.content?.gridRenderer?.items) {
+    const grid = payload.contents.tvBrowseRenderer.content.tvSurfaceContentRenderer.content.gridRenderer;
+    grid.items = hideVideo(grid.items, detectedPage);
+    // Parity with the object-root grid handler below, which also runs these
+    // two. Their absence here is why members-only videos and Shorts came back
+    // on Home after finishing a video: that return trip is served through the
+    // array-root path, so only hideVideo ran and everything else was skipped.
+    grid.items = filterShortsFromItems(grid.items, detectedPage);
+    grid.items = filterBadgedVideos(grid.items, detectedPage);
+    stripCountsFromItems(grid.items, detectedPage);
+    grid.items = filterByKeyword(grid.items, detectedPage);
+    grid.items = filterHiddenChannels(grid.items, detectedPage);
+    if (detectedPage === 'playlists') grid.items = filterHiddenSpecialPlaylistTiles(grid.items);
+    addLongPress(grid.items);
+    normalizeGridRenderer(grid, 'arrayPayload.contents.tvBrowseRenderer.grid');
+  }
+  // onResponseReceivedActions — previously handled nowhere in this file.
+  //
+  // Reported: the masthead/banner ad on Home reappears after starting a video
+  // from Home and returning once it ends. That return path does not deliver a
+  // fresh contents.sectionListRenderer or a continuationContents.* shape, so
+  // none of the branches above see it; YouTube pushes the refreshed shelves
+  // through action wrappers instead. Whatever arrives there therefore skipped
+  // every ad filter, which fits an ad that is stripped on first load and back
+  // after a round trip through the player.
+  //
+  // Route those items through the same processShelves used everywhere else,
+  // so the top-level adSlotRenderer strip and the shelf filters apply.
+  const orra = payload?.onResponseReceivedActions || payload?.onResponseReceivedCommands;
+  if (Array.isArray(orra)) {
+    for (const action of orra) {
+      const items = action?.appendContinuationItemsAction?.continuationItems
+        || action?.reloadContinuationItemsCommand?.continuationItems
+        || action?.replaceEnclosingAction?.item?.sectionListRenderer?.contents
+        || null;
+      if (!Array.isArray(items) || !items.length) continue;
+      appendFileOnlyLog('adblock.onResponseReceivedActions', {
+        detectedPage,
+        keys: Object.keys(action || {}),
+        items: items.length,
+      });
+      processShelves(items, true, detectedPage);
+    }
+  }
+
+  if (payload?.continuationContents?.sectionListContinuation?.contents) {
+    const slc = payload.continuationContents.sectionListContinuation;
+    processShelves(slc.contents, true, detectedPage);
+    timeFilter('shelves', () => consolidateShelves(slc.contents, 'arrayPayload.continuation.sectionList', detectedPage, !!slc.continuations, filterShortsFromItems));
+  }
+  if (payload?.continuationContents?.tvSurfaceContentContinuation?.content?.sectionListRenderer?.contents) {
+    const tvSlc = payload.continuationContents.tvSurfaceContentContinuation.content.sectionListRenderer;
+    clearCarryover();
+    processShelves(tvSlc.contents, true, detectedPage);
+    timeFilter('shelves', () => consolidateShelves(tvSlc.contents, 'arrayPayload.continuation.tvSurface.sectionList', detectedPage, !!tvSlc.continuations, filterShortsFromItems));
+  }
+  if (payload?.continuationContents?.horizontalListContinuation?.items) {
+    const continuation = payload.continuationContents.horizontalListContinuation;
+    deArrowify(continuation.items);
+    hqify(continuation.items);
+    addLongPress(continuation.items);
+    continuation.items = filterContinuationItems(continuation.items, detectedPage, !!continuation?.continuations, 'arrayPayload.horizontalListContinuation');
+    normalizeHorizontalListRenderer(continuation, 'arrayPayload.continuation.horizontal');
+  }
+  if (payload?.continuationContents?.gridContinuation?.items) {
+    const gc = payload.continuationContents.gridContinuation;
+    addLongPress(gc.items);
+    gc.items = filterContinuationItems(gc.items, detectedPage, !!gc?.continuations, 'arrayPayload.gridContinuation');
+    normalizeGridRenderer(gc, 'arrayPayload.continuation.grid');
+  }
+  if (payload?.continuationContents?.playlistVideoListContinuation?.contents) {
+    const plc = payload.continuationContents.playlistVideoListContinuation;
+    // Inject pre-fetched batch if background collect has finished.
+    // Objects are already in memory as JS — no re-parsing of large JSON strings.
+    const prefetch = window.__ttPrefetchedBatch;
+    if (prefetch && Array.isArray(prefetch.allContents)) {
+      window.__ttPrefetchedBatch = null;
+      plc.contents      = prefetch.allContents;
+      plc.continuations = prefetch.continuations;
+      appendFileOnlyLog('playlist.batch_collect.injected', {
+        items: plc.contents.length,
+        hasMore: !!plc.continuations,
+      });
+    }
+    // Same accumulator hook as the object-root handler above. Confirmed
+    // necessary on-device: three continuations arrived through that path, all
+    // with hasContinuation:true, and the FINAL batch (8 of 68 items, the one
+    // carrying no continuation token) only ever came through here. Without
+    // this the accumulator never sees a completion and full_cache.from_native
+    // never fires, so the slow re-download stays on the critical path.
+    // Must run BEFORE filterContinuationItems, which reduces an all-watched
+    // batch to the single kept helper.
+    noteContinuationBatch(String(window.location?.hash || ''), plc.contents, plc.continuations);
+    plc.contents = filterContinuationItems(plc.contents, detectedPage, !!plc?.continuations, 'arrayPayload.playlist.continuation');
+    addLongPress(plc.contents);
+  }
+  const arrayTopPlaylistRenderer = payload?.contents?.tvBrowseRenderer?.content?.tvSurfaceContentRenderer?.content?.twoColumnRenderer?.rightColumn?.playlistVideoListRenderer;
+  if (arrayTopPlaylistRenderer?.contents) {
+    filterPlaylistRendererContents(arrayTopPlaylistRenderer, detectedPage, 'arrayPayload.playlist.renderer');
+    // Reported: inside a playlist no long press menu opened at all, so the
+    // remove entry could not be reached. The playlist page is the one surface
+    // whose items never reached addLongPress. After the filter, so the menu
+    // is attached to the tiles that survive it.
+    notePlaylistPage(arrayTopPlaylistRenderer);
+    addLongPress(arrayTopPlaylistRenderer.contents);
+  }
+  hideViewCountsAndBadges(payload);
+  processTileArraysDeep(payload, detectedPage, 'arrayPayload', 0, filterShortsFromItems);
+}
+
+// ===== DeArrow request queue =====
+
+const _deArrowQueue = [];
+let _deArrowInFlight = 0;
+const _DEARROW_MAX_CONCURRENT = 5;
+
+function _deArrowRunNext() {
+  if (_deArrowInFlight >= _DEARROW_MAX_CONCURRENT || _deArrowQueue.length === 0) return;
+  const task = _deArrowQueue.shift();
+  _deArrowInFlight++;
+  try {
+    const result = task();
+    if (result && typeof result.finally === 'function') result.finally(() => { _deArrowInFlight--; _deArrowRunNext(); });
+    else { _deArrowInFlight--; _deArrowRunNext(); }
+  } catch (_) { _deArrowInFlight--; _deArrowRunNext(); }
+}
+
+function _deArrowEnqueue(taskFn) { _deArrowQueue.push(taskFn); _deArrowRunNext(); }
+
+// ===== JSON.parse Patch =====
+
+// How many mutation payloads one response gets deep-scanned for progress. See
+// the loop that uses it for why there is a limit at all.
+const MAX_DEEP_SCANNED_MUTATIONS = 200;
+
+const origParse = JSON.parse;
+// JSON.parse is patched globally, so this line runs on every JSON.parse
+// call anywhere on the page — not just on navigation. YouTube TV's own
+// code parses JSON constantly (API responses, state polling, prefetching),
+// so logging unconditionally here produced ~800 near-identical entries in
+// a single session. window.__ttLastDetectedPage/__ttParseSeq still update
+// on every call (other code may depend on their being current) — only the
+// logging itself is now collapsed to fire once per actual page/hash change.
+let _lastLoggedParseKey = null;
+// Confirmed on-device: a "RangeError: Maximum call stack size exceeded"
+// right as video playback started, stack showing JSON.parse calling into
+// JSON.parse again through YouTube's own (minified) code — YouTube's API
+// responses can contain nested/escaped JSON strings that its own code
+// parses recursively, a legitimate pattern on its own. But since this
+// patch replaces the *global* JSON.parse, every one of those nested calls
+// also runs this entire function's ad-block/page-detection/progress-cache
+// processing on top of YouTube's own recursion, multiplying the stack
+// depth used per nesting level. Only the outermost call needs any of
+// that; nested calls now just return the parsed result untouched.
+let _parseDepth = 0;
+let _lastLoggedHomeKeySet = null;
+// Reported once per distinct shape: the guide arrives on every navigation.
+let _lastLoggedGuideShape = null;
+
+/**
+ * The key names of a renderer tree, and nothing else.
+ *
+ * Used for the parts of the guide outside items[] — topbar and footer — where
+ * the account row turned out to live. Those carry the account holder's name
+ * and avatar URL, so this records structure only: an object becomes its key
+ * names, an array its length, and every leaf its type. Deliberately not the
+ * values, at any depth.
+ */
+function shapeKeys(node, depth) {
+  if (node === null || node === undefined) return null;
+  if (typeof node !== 'object') return typeof node;
+  if (depth > 4) return '…';
+  if (Array.isArray(node)) {
+    // One entry's shape stands for the array: a topbar's buttons are alike,
+    // and twelve copies of the same shape say nothing twelve times.
+    return node.length ? ['[' + node.length + ']', shapeKeys(node[0], depth + 1)] : [];
+  }
+  const out = {};
+  const names = Object.keys(node).sort();
+  for (let i = 0; i < names.length && i < 14; i++) {
+    out[names[i]] = shapeKeys(node[names[i]], depth + 1);
+  }
+  return out;
+}
+let _lastLoggedNonTileKeySet = null;
+let _lastLoggedNonShelfKeySet = null;
+JSON.parse = function () {
+  // Before the native parse, not after. The clock used to start on the line
+  // below, so every number this file has ever reported excluded JSON.parse
+  // itself — which made "a parse took four seconds" ambiguous between our work
+  // and the platform's, and sent two investigations after the wrong thing. One
+  // Date.now() on the hot path is worth not repeating that.
+  const _enteredAt = Date.now();
+  const r = origParse.apply(this, arguments);
+  _parseDepth++;
+  if (_parseDepth > 1) { _parseDepth--; return r; }
+  // Reported: a lot of buffering, and nothing in the log about it. Everything
+  // below runs on the same thread as the player, so how long it takes is worth
+  // knowing when a stall is being explained. Only measured while the playback
+  // diagnostic is on, and playbackHealth.js reports it next to each stall.
+  const _startedAt = playbackDiagnosticsEnabled() ? Date.now() : 0;
+  // Checkpoints across the regions no timeFilter covers.
+  //
+  // The reason this exists: a capture with nativeMs in it put 95% of the
+  // measured time in neither JSON.parse nor any timed filter. Trivial
+  // responses cost real money — {"responseContext"} 207ms, a three-element
+  // array 256ms, {"responseContext","actionStatePair"} 502ms — with nativeMs
+  // at 0 and every filter in single digits. A cost that does not scale with
+  // the data is not in the walkers, and three guesses at what it is instead
+  // have all been wrong. So the remainder gets measured rather than reasoned
+  // about.
+  //
+  // Checkpoints and not more timeFilter calls because the regions contain
+  // their own returns — the watch path has one — and wrapping them in
+  // closures would change what those returns return.
+  const _marks = _startedAt ? {} : null;
+  let _markAt = _startedAt;
+  const mark = _startedAt
+    ? (name) => { const now = Date.now(); _marks[name] = (_marks[name] || 0) + (now - _markAt); _markAt = now; }
+    : () => { };
+  try {
+    const detectedPage = detectPageFromResponse(r) || detectCurrentPage();
+    window.__ttLastDetectedPage = detectedPage;
+    window.__ttParseSeq = Number(window.__ttParseSeq || 0) + 1;
+    const hash = location.hash || '';
+    const parseKey = detectedPage + '|' + hash;
+    if (parseKey !== _lastLoggedParseKey) {
+      _lastLoggedParseKey = parseKey;
+      appendFileOnlyLog('parse.begin', { detectedPage, hash });
+    }
+
+    // Diagnostic: reported a large, near-full-page ad on the home page
+    // after a refresh — not explained by adPlacements/playerAds/adSlots
+    // (confirmed: zero hits for any of those across a full session with
+    // this logging active) or by the promoted-tile case logged above.
+    // Cheap (just top-level key names, not full content) and deduped per
+    // distinct key set so it only logs once per response shape, not once
+    // per parse — the actual field carrying this ad is still unknown, so
+    // logging broadly here beats guessing a specific path blind.
+    mark('detectMs');
+    if (detectedPage === 'home' && !Array.isArray(r) && r && typeof r === 'object') {
+      const keySet = Object.keys(r).sort().join(',');
+      if (keySet !== _lastLoggedHomeKeySet) {
+        _lastLoggedHomeKeySet = keySet;
+        appendFileOnlyLog('home.responseShape', { keys: Object.keys(r) });
+      }
+    }
+
+    // The sidebar's own response, every section of it.
+    //
+    // Asked for: hide the profile entry above Home that shows one letter of
+    // the account name. The first attempt logged this from the sidebar
+    // settings screen, which only runs when that screen is opened — so a
+    // capture of someone opening pages, which is exactly what was asked for
+    // and done, contained nothing at all. This sits in the parse hook every
+    // response passes through instead.
+    //
+    // Not in customGuideAction.js, which is where the guide is handled: that
+    // file wraps JSON.parse early and keeps its imports deliberately few, and
+    // pulling the logger in there could change when it loads.
+    //
+    // Renderer names only, never titles: the entry being looked for carries
+    // the account holder's own name.
+    if (r && !Array.isArray(r) && Array.isArray(r.items) && r.items[0]?.guideSectionRenderer) {
+      try {
+        const sections = r.items.map((section) => {
+          const inner = section?.guideSectionRenderer;
+          const items = (inner?.originalItems || inner?.items || []);
+          return {
+            section: Object.keys(section || {})[0] || '?',
+            count: items.length,
+            items: items.slice(0, 14).map((item) => Object.keys(item || {})[0] || '?'),
+          };
+        });
+        const signature = JSON.stringify(sections) + '|' + Object.keys(r).sort().join(',');
+        if (signature !== _lastLoggedGuideShape) {
+          _lastLoggedGuideShape = signature;
+          appendFileOnlyLog('sidebar.guideShape', {
+            sections,
+            // Anything outside items[] — where a header or an account row
+            // would sit, and the reason a loop over items[] found nothing.
+            guideKeys: Object.keys(r),
+            // And what is in them. The first capture answered the question it
+            // was asked and raised the next one: one section, twelve entries,
+            // every one a guideEntryRenderer and so already hideable — and
+            // guideKeys holding topbar, footer and startupBehaviours. The
+            // account row is in one of those, not in items[], which is why
+            // nothing that walks items[] can reach it.
+            topbar: shapeKeys(r.topbar, 0),
+            footer: shapeKeys(r.footer, 0),
+            // startupBehaviours as well, and not only to find the account
+            // row. The other open question is why powering the TV off during
+            // a video asks for the profile on the way back in while powering
+            // it off on a page does not — and a key called startupBehaviours,
+            // arriving in the same response as the account row, is the best
+            // candidate for naming it that has turned up. Two questions, one
+            // capture.
+            startupBehaviours: shapeKeys(r.startupBehaviours, 0),
+          });
+        }
+      } catch (_) { }
+    }
+
+    if (Array.isArray(r)) {
+      for (let i = 0; i < r.length; i++) processResponsePayload(r[i], detectedPage);
+      return r;
+    }
+
+    const adBlockEnabled = configRead('enableAdBlock');
+    if (r.adPlacements && adBlockEnabled) {
+      appendFileOnlyLog('adblock.stripped', { path: 'objectRoot.adPlacements', detectedPage });
+      r.adPlacements = [];
+    }
+    if (r.playerAds && adBlockEnabled) {
+      appendFileOnlyLog('adblock.stripped', { path: 'objectRoot.playerAds', detectedPage });
+      r.playerAds = false;
+    }
+    if (r.adSlots && adBlockEnabled) {
+      appendFileOnlyLog('adblock.stripped', { path: 'objectRoot.adSlots', detectedPage });
+      r.adSlots = [];
+    }
+
+    const hiddenLibraryTabIds = configRead('hiddenLibraryTabIds');
+    if (Array.isArray(hiddenLibraryTabIds) && hiddenLibraryTabIds.length > 0) {
+      applyLibraryTabHiding(r, hiddenLibraryTabIds);
+    } else {
+      applyLibraryShelfSpacing();
+    }
+
+    mark('diagMs');
+    timeFilter('videoLength', () => noteVideoLength(r));
+    timeFilter('progressCache', () => updateProgressCache(r));
+    // This is the one piece of per-response work that was never attributed,
+    // and it is the most expensive shape of work in the file: a recursive walk
+    // to depth ten of every mutation payload, with a fresh output array and a
+    // fresh WeakSet allocated per mutation, on top of the pass
+    // updateProgressCache has already made over the same mutations.
+    //
+    // Why it matters, from a capture where the player froze: one parse cost
+    // 4343ms of 4373ms total, and another 3930ms, with no filter attribution
+    // on either — and the slow ones were on home and library, never on watch,
+    // which is exactly the condition below. Everything else here is inside a
+    // timeFilter and so was ruled out by its own numbers; this was invisible.
+    //
+    // Three changes, no behaviour lost:
+    //   timeFilter    it can never be invisible again
+    //   shared seen   one WeakSet for the whole batch instead of one per
+    //                 mutation. Mutations in a batch share sub-objects, so
+    //                 this also stops re-walking the same nodes; skipping a
+    //                 repeat is harmless when the only thing collected is
+    //                 {id, percent} and an id is written once.
+    //   a cap         a batch far larger than this is where the cost lives,
+    //                 and the marginal value of the two-hundredth mutation is
+    //                 nil. Logged when it bites, so the number can be judged
+    //                 from a capture rather than guessed at twice.
+    if (detectedPage !== 'watch' && r?.frameworkUpdates?.entityBatchUpdate?.mutations) {
+      timeFilter('progressDeep', () => {
+        if (!window._ttVideoProgressCache) window._ttVideoProgressCache = {};
+        const mutations = r.frameworkUpdates.entityBatchUpdate.mutations;
+        const seen = new WeakSet();
+        const limit = Math.min(mutations.length, MAX_DEEP_SCANNED_MUTATIONS);
+        for (let i = 0; i < limit; i++) {
+          try {
+            const entries = collectWatchProgressEntries(mutations[i]?.payload || {}, [], 0, seen);
+            for (const entry of entries) {
+              if (window._ttVideoProgressCache[entry.id] === undefined) window._ttVideoProgressCache[entry.id] = Number(entry.percent);
+            }
+          } catch (_) { }
+        }
+        if (mutations.length > limit) {
+          // player., not progressDeep.: an unlisted prefix lands in 'other',
+          // and this is read beside the stalls. parse.slow was renamed for the
+          // same reason after it was filtered out by the very narrowing done
+          // to watch playback.
+          appendFileOnlyLog('player.progressDeepCapped', { page: detectedPage, mutations: mutations.length, scanned: limit });
+        }
+      });
+    }
+
+    mark('earlyMs');
+    // =========================================================
+    // === WATCH PAGE FAST PATH                               ===
+    // =========================================================
+    if (detectedPage === 'watch') {
+      if (r.paidContentOverlay && !configRead('enablePaidPromotionOverlay')) r.paidContentOverlay = null;
+      if (r.endscreen && configRead('enableHideEndScreenCards')) r.endscreen = null;
+      if (r.messages && Array.isArray(r.messages) && !configRead('enableYouThereRenderer')) r.messages = r.messages.filter(msg => !msg?.youThereRenderer);
+      if (r?.title?.runs) PatchSettings(r);
+      if (r?.streamingData?.adaptiveFormats && configRead('preferredVideoCodec') !== 'any') {
+        try {
+          const preferredCodec = configRead('preferredVideoCodec');
+          if (r.streamingData.adaptiveFormats.find(f => f.mimeType.includes(preferredCodec))) {
+            r.streamingData.adaptiveFormats = r.streamingData.adaptiveFormats.filter(f => f.mimeType.startsWith('audio/') || f.mimeType.includes(preferredCodec));
+          }
+        } catch (_) { }
+      }
+      // Strip YouTube own shopping and NFL watermark overlays (upstream
+      // f91f3f8). Deliberately NOT folded into the SponsorBlock branch below:
+      // that branch only assigns timelyActionRenderers when segments exist, so
+      // with manual skips enabled on a video that has none, the originals
+      // would survive untouched.
+      // Upstream first shipped this with || between the two type checks, which
+      // can never be false - a value cannot equal both - so nothing was ever
+      // filtered. && is the corrected form.
+      if (Array.isArray(r?.playerOverlays?.playerOverlayRenderer?.timelyActionRenderers)) {
+        r.playerOverlays.playerOverlayRenderer.timelyActionRenderers =
+          r.playerOverlays.playerOverlayRenderer.timelyActionRenderers.filter(a =>
+            a?.timelyActionRenderer?.type !== 'TIMELY_ACTION_TYPE_SHOPPING' &&
+            a?.timelyActionRenderer?.type !== 'TIMELY_ACTION_TYPE_NFL_WATERMARK');
+      }
+      if (configRead('sponsorBlockManualSkips').length > 0 && r?.playerOverlays?.playerOverlayRenderer) {
+        try {
+          const manualSkippedSegments = configRead('sponsorBlockManualSkips');
+          const timelyActions = [];
+          if (window?.sponsorblock?.segments) {
+            for (const segment of window.sponsorblock.segments) {
+              if (manualSkippedSegments.includes(segment.category)) {
+                timelyActions.push(timelyAction(t('sponsorblock.toasts.skip', { segment: t(`sponsorblock.segments.${segment.category}`) }), 'SKIP_NEXT', { clickTrackingParams: null, showEngagementPanelEndpoint: { customAction: { action: 'SKIP', parameters: { time: segment.segment[1] } } } }, segment.segment[0] * 1000, segment.segment[1] * 1000 - segment.segment[0] * 1000));
+              }
+            }
+            r.playerOverlays.playerOverlayRenderer.timelyActionRenderers = timelyActions;
+          }
+        } catch (_) { }
+      } else if (r?.playerOverlays?.playerOverlayRenderer) {
+        r.playerOverlays.playerOverlayRenderer.timelyActionRenderers = [];
+      }
+      timeFilter('playerButtons', () => filterPlayerButtonsInResponse(r));
+      timeFilter('playlistEnd', () => stopAtPlaylistEnd(r));
+      stopForcedSubtitles(r);
+      timeFilter('viewCounts', () => hideViewCountsAndBadges(r));
+      timeFilter('dislikes', () => addDislikes(r));
+      if (r?.transportControls?.transportControlsRenderer?.promotedActions && configRead('enableSponsorBlockHighlight')) {
+        try {
+          if (window?.sponsorblock?.segments) {
+            const category = window.sponsorblock.segments.find(seg => seg.category === 'poi_highlight');
+            if (category) {
+              r.transportControls.transportControlsRenderer.promotedActions.push({ type: 'TRANSPORT_CONTROLS_BUTTON_TYPE_SPONSORBLOCK_HIGHLIGHT', button: { buttonRenderer: ButtonRenderer(false, t('sponsorblock.toasts.skipToHighlight'), 'SKIP_NEXT', { clickTrackingParams: null, customAction: { action: 'SKIP', parameters: { time: category.segment[0] } } }) } });
+            }
+          }
+        } catch (_) { }
+      }
+      if (r?.contents?.singleColumnWatchNextResults?.pivot?.sectionListRenderer) {
+        hideRelatedVideos(r.contents.singleColumnWatchNextResults.pivot.sectionListRenderer);
+        try {
+          const signinReminderEnabled = configRead('enableSigninReminder');
+          const watchNextSlr = r.contents.singleColumnWatchNextResults.pivot.sectionListRenderer;
+          if (!signinReminderEnabled) watchNextSlr.contents = watchNextSlr.contents.filter(elm => !elm.alertWithActionsRenderer);
+          processShelves(watchNextSlr.contents, false, detectedPage);
+          timeFilter('shelves', () => consolidateShelves(watchNextSlr.contents, 'watchNext', detectedPage, !!watchNextSlr.continuations, filterShortsFromItems));
+          if (window.queuedVideos.videos.length > 0) {
+            const queuedVideosClone = window.queuedVideos.videos.slice();
+            queuedVideosClone.unshift(TileRenderer('Clear Queue', { customAction: { action: 'CLEAR_QUEUE' } }));
+            watchNextSlr.contents.unshift(ShelfRenderer('Queued Videos', queuedVideosClone, queuedVideosClone.findIndex(v => v.contentId === window.queuedVideos.lastVideoId) !== -1 ? queuedVideosClone.findIndex(v => v.contentId === window.queuedVideos.lastVideoId) : 0));
+          }
+        } catch (_) { }
+      }
+      if (r?.continuationContents?.sectionListContinuation?.contents) {
+        const wNextSlc = r.continuationContents.sectionListContinuation;
+        processShelves(wNextSlc.contents, false, detectedPage);
+        timeFilter('shelves', () => consolidateShelves(wNextSlc.contents, 'watchNext.continuation.sectionList', detectedPage, !!wNextSlc.continuations, filterShortsFromItems));
+      }
+      if (r?.continuationContents?.horizontalListContinuation?.items) {
+        const continuation = r.continuationContents.horizontalListContinuation;
+        addLongPress(continuation.items);
+        continuation.items = filterContinuationItems(continuation.items, detectedPage, !!continuation?.continuations, 'watchNext.continuation.horizontal');
+        normalizeHorizontalListRenderer(continuation, 'watchNext.continuation.horizontal');
+      }
+      if (r?.continuationContents?.pivotContinuation?.contents) {
+        const wNextPivot = r.continuationContents.pivotContinuation;
+        processShelves(wNextPivot.contents, false, detectedPage);
+        timeFilter('shelves', () => consolidateShelves(wNextPivot.contents, 'watchNext.continuation.pivot', detectedPage, !!wNextPivot.continuations, filterShortsFromItems));
+      }
+      mark('watchMs');
+      return r;
+    }
+    // =========================================================
+    // === END WATCH PAGE FAST PATH                           ===
+    // =========================================================
+
+    const signinReminderEnabled = configRead('enableSigninReminder');
+    if (r.paidContentOverlay && !configRead('enablePaidPromotionOverlay')) r.paidContentOverlay = null;
+    if (r?.streamingData?.adaptiveFormats && configRead('preferredVideoCodec') !== 'any') {
+      try {
+        const preferredCodec = configRead('preferredVideoCodec');
+        if (r.streamingData.adaptiveFormats.find(f => f.mimeType.includes(preferredCodec))) {
+          r.streamingData.adaptiveFormats = r.streamingData.adaptiveFormats.filter(f => f.mimeType.startsWith('audio/') || f.mimeType.includes(preferredCodec));
+        }
+      } catch (_) { }
+    }
+
+    addChannelSidebarButton(r);
+    if (r?.contents?.tvBrowseRenderer?.content?.tvSurfaceContentRenderer?.content?.sectionListRenderer?.contents) {
+      const tvBrowseMainSlr = r.contents.tvBrowseRenderer.content.tvSurfaceContentRenderer.content.sectionListRenderer;
+      if (!signinReminderEnabled) tvBrowseMainSlr.contents = tvBrowseMainSlr.contents.filter(elm => !elm.feedNudgeRenderer);
+      if (adBlockEnabled) {
+        tvBrowseMainSlr.contents = tvBrowseMainSlr.contents.filter(elm => !elm.adSlotRenderer);
+        for (const shelve of tvBrowseMainSlr.contents) {
+          if (shelve.shelfRenderer) {
+            try { shelve.shelfRenderer.content.horizontalListRenderer.items = shelve.shelfRenderer.content.horizontalListRenderer.items.filter(item => !item.adSlotRenderer); } catch (_) { }
+          }
+        }
+      }
+      processShelves(tvBrowseMainSlr.contents, true, detectedPage);
+      timeFilter('shelves', () => consolidateShelves(tvBrowseMainSlr.contents, 'tvBrowse.sectionList', detectedPage, !!tvBrowseMainSlr.continuations, filterShortsFromItems));
+    }
+
+    if (r.endscreen && configRead('enableHideEndScreenCards')) r.endscreen = null;
+    if (r.messages && Array.isArray(r.messages) && !configRead('enableYouThereRenderer')) r.messages = r.messages.filter(msg => !msg?.youThereRenderer);
+    if (!Array.isArray(r) && r?.entries && adBlockEnabled) r.entries = r.entries?.filter(elm => !elm?.command?.reelWatchEndpoint?.adClientParams?.isAd);
+    if (r?.title?.runs) PatchSettings(r);
+
+    if (r?.contents?.sectionListRenderer?.contents) {
+      processShelves(r.contents.sectionListRenderer.contents, true, detectedPage);
+      timeFilter('shelves', () => consolidateShelves(r.contents.sectionListRenderer.contents, 'sectionList', detectedPage, !!r.contents.sectionListRenderer.continuations, filterShortsFromItems));
+    }
+
+    if (r?.contents?.tvBrowseRenderer?.content?.tvSurfaceContentRenderer?.content?.gridRenderer?.items) {
+      const grid = r.contents.tvBrowseRenderer.content.tvSurfaceContentRenderer.content.gridRenderer;
+      let gridItems = hideVideo(grid.items, detectedPage);
+      gridItems = filterShortsFromItems(gridItems, detectedPage);
+      gridItems = filterBadgedVideos(gridItems, detectedPage);
+      stripCountsFromItems(gridItems, detectedPage);
+      gridItems = filterByKeyword(gridItems, detectedPage);
+      gridItems = filterHiddenChannels(gridItems, detectedPage);
+      if (detectedPage === 'playlists') gridItems = filterHiddenSpecialPlaylistTiles(gridItems);
+      addLongPress(gridItems);
+      grid.items = gridItems;
+      normalizeGridRenderer(grid, 'contents.tvBrowseRenderer.grid');
+    }
+
+    const topPlaylistRenderer = r?.contents?.tvBrowseRenderer?.content?.tvSurfaceContentRenderer?.content?.twoColumnRenderer?.rightColumn?.playlistVideoListRenderer;
+    if (topPlaylistRenderer?.contents) {
+      // If a previous visit (or the pre-reload pass) already collected this
+      // playlist in full, serve it here instead. Nulling continuations is the
+      // whole point: with no continuation token there is no keep-one branch,
+      // so no helper tile is created and nothing gets stranded in the virtual
+      // list's data model. Starving YouTube's refill loop is safe here
+      // precisely because the list is already complete — nothing further
+      // needs loading.
+      const playlistKey = String(window.location?.hash || '');
+      const cachedFull = getCachedFullPlaylist(playlistKey);
+      if (cachedFull) {
+        appendFileOnlyLog('playlist.full_cache.injected', {
+          key: playlistKey,
+          items: cachedFull.length,
+          replaced: topPlaylistRenderer.contents.length,
+        });
+        topPlaylistRenderer.contents = cachedFull.slice();
+        topPlaylistRenderer.continuations = null;
+        // One-shot: the cache exists only to carry the full list across the
+        // reload it triggered. Keeping it would serve these same renderers on
+        // every later visit, and their embedded watch-progress overlays are
+        // frozen at collection time — so anything watched since would come
+        // back looking unwatched.
+        consumeCachedFullPlaylist(playlistKey);
+      } else {
+        // Hand the raw first batch to the collector: _collectAll only returns
+        // the CONTINUATION batches, so the cached full list needs this to be
+        // complete from item 1.
+        noteInitialPlaylistContents(playlistKey, topPlaylistRenderer.contents);
+      }
+      storePlaylistContinuationToken(topPlaylistRenderer.continuations, 'topPlaylist');
+      // Queue background collection of whatever YouTube does not fetch
+      // itself — deferred until its own loading goes quiet, so the collector
+      // resumes from there instead of refetching. See
+      // scheduleCollectAfterNativeSettles() in playlistBatchCollect.js.
+      // No-ops when serving from cache: continuations is null, so there is no
+      // token to collect with.
+      scheduleCollectAfterNativeSettles(topPlaylistRenderer.continuations, 'page_load');
+      filterPlaylistRendererContents(topPlaylistRenderer, detectedPage, 'playlist.renderer');
+      notePlaylistPage(topPlaylistRenderer);
+      addLongPress(topPlaylistRenderer.contents);
+    }
+
+    if (r?.continuationContents?.sectionListContinuation?.contents) {
+      const contSlc = r.continuationContents.sectionListContinuation;
+      processShelves(contSlc.contents, false, detectedPage);
+      timeFilter('shelves', () => consolidateShelves(contSlc.contents, 'continuation.sectionList', detectedPage, !!contSlc.continuations, filterShortsFromItems));
+    }
+
+    if (r?.continuationContents?.tvSurfaceContentContinuation?.content?.sectionListRenderer?.contents) {
+      const tvSlc = r.continuationContents.tvSurfaceContentContinuation.content.sectionListRenderer;
+      clearCarryover();
+      processShelves(tvSlc.contents, false, detectedPage);
+      timeFilter('shelves', () => consolidateShelves(tvSlc.contents, 'continuation.tvSurface.sectionList', detectedPage, !!tvSlc.continuations, filterShortsFromItems));
+    }
+
+    if (r?.continuationContents?.pivotContinuation?.contents) {
+      const contPivot = r.continuationContents.pivotContinuation;
+      appendFileOnlyLog('pivot.continuation.hit', { count: contPivot.contents.length });
+      processShelves(contPivot.contents, false, detectedPage);
+      timeFilter('shelves', () => consolidateShelves(contPivot.contents, 'continuation.pivot', detectedPage, !!contPivot.continuations, filterShortsFromItems));
+    }
+
+    if (r?.continuationContents?.horizontalListContinuation?.items) {
+      const continuation = r.continuationContents.horizontalListContinuation;
+      deArrowify(continuation.items);
+      hqify(continuation.items);
+      addLongPress(continuation.items);
+      continuation.items = filterContinuationItems(continuation.items, detectedPage, !!continuation?.continuations, 'continuation.horizontal');
+      normalizeHorizontalListRenderer(continuation, 'continuation.horizontal');
+    }
+
+    if (r?.continuationContents?.gridContinuation?.items) {
+      const gc = r.continuationContents.gridContinuation;
+      addLongPress(gc.items);
+      gc.items = filterContinuationItems(gc.items, detectedPage, !!gc?.continuations, 'gridContinuation');
+      normalizeGridRenderer(gc, 'continuation.grid');
+    }
+
+    if (r?.continuationContents?.playlistVideoListContinuation?.contents) {
+      const plc = r.continuationContents.playlistVideoListContinuation;
+      const hasContinuation = !!plc?.continuations;
+      storePlaylistContinuationToken(plc.continuations, 'plc');
+      appendFileOnlyLog('playlist.continuation.detected', { detectedPage, itemCount: Array.isArray(plc.contents) ? plc.contents.length : 0, hasContinuation });
+      // Feed the raw batch to the full-playlist accumulator BEFORE filtering,
+      // so it collects real items rather than the single kept helper. This is
+      // the same data the background collector would re-download, only it is
+      // already here and roughly ten seconds sooner.
+      noteContinuationBatch(String(window.location?.hash || ''), plc.contents, plc.continuations);
+      plc.contents = filterContinuationItems(plc.contents, detectedPage, hasContinuation, 'playlist.continuation');
+      addLongPress(plc.contents);
+    }
+
+    if (r?.contents?.tvBrowseRenderer?.content?.tvSecondaryNavRenderer?.sections) {
+      for (const section of r.contents.tvBrowseRenderer.content.tvSecondaryNavRenderer.sections) {
+        if (!Array.isArray(section?.tvSecondaryNavSectionRenderer?.tabs)) continue;
+        if (configRead('sortSubscriptionsByAlphabet')) {
+          try {
+            section.tvSecondaryNavSectionRenderer.tabs.sort((a, b) => {
+              if (a.tabRenderer.selected && !b.tabRenderer.selected) return -1;
+              if (!a.tabRenderer.selected && b.tabRenderer.selected) return 1;
+              return a.tabRenderer.title.localeCompare(b.tabRenderer.title);
+            });
+          } catch (sortErr) { appendFileOnlyLog('tabs.sort.error', { msg: String(sortErr?.message || sortErr) }); }
+        }
+        if (!configRead('enableShorts')) {
+          const tabs = section.tvSecondaryNavSectionRenderer.tabs;
+          for (let i = tabs.length - 1; i >= 0; i--) {
+            const tab = tabs[i];
+            const tabTitle = String(tab?.tabRenderer?.title?.simpleText || collectAllText(tab?.tabRenderer?.title).join(' ')).toLowerCase();
+            const tabBrowseId = String(extractNavTabBrowseId(tab)).toLowerCase();
+            if (tabTitle.includes('short') || tabBrowseId.includes('short')) {
+              appendFileOnlyLog('shorts.navtab.removed', { tabTitle, tabBrowseId, index: i });
+              tabs.splice(i, 1);
+            }
+          }
+        }
+        for (const tab of section.tvSecondaryNavSectionRenderer.tabs) {
+          try {
+            const tabBrowseId = String(extractNavTabBrowseId(tab)).toLowerCase();
+            let tabPage = detectedPage;
+            if (tabBrowseId.includes('fesubscription')) tabPage = 'subscriptions';
+            else if (tabBrowseId.startsWith('uc')) tabPage = 'channel';
+            else if (tabBrowseId === 'fehistory') tabPage = 'history';
+            else if (tabBrowseId === 'felibrary') tabPage = 'library';
+            else if (tabBrowseId === 'feplaylist_aggregation') tabPage = 'playlists';
+            else if (tabBrowseId === 'femy_youtube' || tabBrowseId === 'vlwl' || tabBrowseId === 'vlll' || tabBrowseId.startsWith('vlpl')) tabPage = 'playlist';
+
+            const tabPath = `tab.${tabBrowseId || 'unknown'}`;
+            const tabSlr = tab?.tabRenderer?.content?.tvSurfaceContentRenderer?.content?.sectionListRenderer;
+            if (tabSlr && Array.isArray(tabSlr.contents)) {
+              processShelves(tabSlr.contents, true, tabPage);
+              timeFilter('shelves', () => consolidateShelves(tabSlr.contents, tabPath, tabPage, !!tabSlr.continuations, filterShortsFromItems));
+            }
+            const tabGridItems = tab?.tabRenderer?.content?.tvSurfaceContentRenderer?.content?.gridRenderer?.items;
+            if (Array.isArray(tabGridItems)) {
+              let filteredTabGrid = hideVideo(tabGridItems, tabPage);
+              filteredTabGrid = filterShortsFromItems(filteredTabGrid, tabPage);
+              filteredTabGrid = filterBadgedVideos(filteredTabGrid, tabPage);
+              stripCountsFromItems(filteredTabGrid, tabPage);
+              filteredTabGrid = filterByKeyword(filteredTabGrid, tabPage);
+              filteredTabGrid = filterHiddenChannels(filteredTabGrid, tabPage);
+              if (tabPage === 'playlists') filteredTabGrid = filterHiddenSpecialPlaylistTiles(filteredTabGrid);
+              addLongPress(filteredTabGrid);
+              tab.tabRenderer.content.tvSurfaceContentRenderer.content.gridRenderer.items = filteredTabGrid;
+              normalizeGridRenderer(tab.tabRenderer.content.tvSurfaceContentRenderer.content.gridRenderer, 'tab.grid');
+            }
+            const tabPlaylistRenderer = tab?.tabRenderer?.content?.tvSurfaceContentRenderer?.content?.playlistVideoListRenderer;
+            if (tabPlaylistRenderer?.contents) filterPlaylistRendererContents(tabPlaylistRenderer, tabPage, 'tab.playlist.renderer');
+          } catch (tabErr) { appendFileOnlyLog('tab.process.error', { msg: String(tabErr?.message || tabErr) }); }
+        }
+      }
+    }
+
+    if (r?.contents?.singleColumnWatchNextResults) {
+      appendFileOnlyLog('watchNext.shape', { hasPivot: !!r.contents.singleColumnWatchNextResults.pivot, keys: Object.keys(r.contents.singleColumnWatchNextResults) });
+    }
+
+    if (r?.contents?.singleColumnWatchNextResults?.pivot?.sectionListRenderer) {
+      hideRelatedVideos(r.contents.singleColumnWatchNextResults.pivot.sectionListRenderer);
+      try {
+        const nonWatchWnSlr = r.contents.singleColumnWatchNextResults.pivot.sectionListRenderer;
+        if (!signinReminderEnabled) nonWatchWnSlr.contents = nonWatchWnSlr.contents.filter(elm => !elm.alertWithActionsRenderer);
+        processShelves(nonWatchWnSlr.contents, false, detectedPage);
+        timeFilter('shelves', () => consolidateShelves(nonWatchWnSlr.contents, 'watchNext', detectedPage, !!nonWatchWnSlr.continuations, filterShortsFromItems));
+        if (window.queuedVideos.videos.length > 0) {
+          const queuedVideosClone = window.queuedVideos.videos.slice();
+          queuedVideosClone.unshift(TileRenderer('Clear Queue', { customAction: { action: 'CLEAR_QUEUE' } }));
+          nonWatchWnSlr.contents.unshift(ShelfRenderer('Queued Videos', queuedVideosClone, queuedVideosClone.findIndex(v => v.contentId === window.queuedVideos.lastVideoId) !== -1 ? queuedVideosClone.findIndex(v => v.contentId === window.queuedVideos.lastVideoId) : 0));
+        }
+      } catch (_) { }
+    }
+
+    // Strip YouTube own shopping and NFL watermark overlays (upstream
+    // f91f3f8). Deliberately NOT folded into the SponsorBlock branch below:
+    // that branch only assigns timelyActionRenderers when segments exist, so
+    // with manual skips enabled on a video that has none, the originals
+    // would survive untouched.
+    // Upstream first shipped this with || between the two type checks, which
+    // can never be false - a value cannot equal both - so nothing was ever
+    // filtered. && is the corrected form.
+    if (Array.isArray(r?.playerOverlays?.playerOverlayRenderer?.timelyActionRenderers)) {
+      r.playerOverlays.playerOverlayRenderer.timelyActionRenderers =
+        r.playerOverlays.playerOverlayRenderer.timelyActionRenderers.filter(a =>
+          a?.timelyActionRenderer?.type !== 'TIMELY_ACTION_TYPE_SHOPPING' &&
+          a?.timelyActionRenderer?.type !== 'TIMELY_ACTION_TYPE_NFL_WATERMARK');
+    }
+    if (configRead('sponsorBlockManualSkips').length > 0 && r?.playerOverlays?.playerOverlayRenderer) {
+      try {
+        const manualSkippedSegments = configRead('sponsorBlockManualSkips');
+        const timelyActions = [];
+        if (window?.sponsorblock?.segments) {
+          for (const segment of window.sponsorblock.segments) {
+            if (manualSkippedSegments.includes(segment.category)) {
+              timelyActions.push(timelyAction(`Skip ${segment.category}`, 'SKIP_NEXT', { clickTrackingParams: null, showEngagementPanelEndpoint: { customAction: { action: 'SKIP', parameters: { time: segment.segment[1] } } } }, segment.segment[0] * 1000, segment.segment[1] * 1000 - segment.segment[0] * 1000));
+            }
+          }
+          r.playerOverlays.playerOverlayRenderer.timelyActionRenderers = timelyActions;
+        }
+      } catch (_) { }
+    } else if (r?.playerOverlays?.playerOverlayRenderer) {
+      r.playerOverlays.playerOverlayRenderer.timelyActionRenderers = [];
+    }
+
+    timeFilter('playerButtons', () => filterPlayerButtonsInResponse(r));
+    timeFilter('playlistEnd', () => stopAtPlaylistEnd(r));
+    stopForcedSubtitles(r);
+    timeFilter('viewCounts', () => hideViewCountsAndBadges(r));
+    timeFilter('dislikes', () => addDislikes(r));
+    if (r?.transportControls?.transportControlsRenderer?.promotedActions && configRead('enableSponsorBlockHighlight')) {
+      try {
+        if (window?.sponsorblock?.segments) {
+          const category = window.sponsorblock.segments.find(seg => seg.category === 'poi_highlight');
+          if (category) {
+            r.transportControls.transportControlsRenderer.promotedActions.push({ type: 'TRANSPORT_CONTROLS_BUTTON_TYPE_SPONSORBLOCK_HIGHLIGHT', button: { buttonRenderer: ButtonRenderer(false, 'Skip to highlight', 'SKIP_NEXT', { clickTrackingParams: null, customAction: { action: 'SKIP', parameters: { time: category.segment[0] } } }) } });
+          }
+        }
+      } catch (_) { }
+    }
+
+    mark('browseMs');
+    timeFilter('tilesDeep', () => processTileArraysDeep(r, detectedPage, 'response', 0, filterShortsFromItems));
+    return r;
+  } catch (error) {
+    appendFileOnlyLog('parse.error', { msg: String(error), stack: String(error?.stack || '').slice(0, 200) });
+    if (!window.__ttAdblockParseWarned && configRead('enableDebugConsole')) {
+      window.__ttAdblockParseWarned = true;
+      console.warn('[TizenTube] adblock parser patch failed', error);
+    }
+    return r;
+  } finally {
+    _parseDepth--;
+    if (_startedAt) {
+      // Runs on every path, including the watch branch's own return and the
+      // catch, so no exit is unaccounted for.
+      mark('tailMs');
+      const _took = Date.now() - _startedAt;
+      noteParseCost(_took);
+      // The aggregate says how much; this says which response, which is the
+      // part that can be acted on. nativeMs is how long JSON.parse itself
+      // took, so a slow line says which side of it was slow.
+      noteParseShape(_took, window.__ttLastDetectedPage, r, _startedAt - _enteredAt, _marks);
+    }
+  }
+};
+
+window.JSON.parse = JSON.parse;
+
+function _patchYttvJsonParse() {
+  let patched = 0;
+  try {
+    for (const key in window._yttv) {
+      if (window._yttv[key] && window._yttv[key].JSON && window._yttv[key].JSON.parse) { window._yttv[key].JSON.parse = JSON.parse; patched++; }
+    }
+  } catch (_) { }
+  return patched;
+}
+
+_patchYttvJsonParse();
+const _yttvPatchInterval = setInterval(() => {
+  try {
+    if (!window._yttv || !Object.keys(window._yttv).length) return;
+    const patched = _patchYttvJsonParse();
+    if (patched > 0) clearInterval(_yttvPatchInterval);
+  } catch (_) { }
+}, 300);
+setTimeout(() => clearInterval(_yttvPatchInterval), 15000);
+
+
+// ===== processShelves =====
+
+function processShelves(shelves, shouldAddPreviews = true, pageHint = null) {
+  if (!Array.isArray(shelves)) return;
+  const activePage = pageHint || window.__ttLastDetectedPage || detectCurrentPage();
+  filterHiddenSpecialPlaylistShelves(shelves);
+  filterChannelShelves(shelves, activePage);
+  filterMusicShelves(shelves, activePage);
+  filterSurveyShelves(shelves, activePage);
+  for (let i = shelves.length - 1; i >= 0; i--) {
+    try {
+      const shelve = shelves[i];
+      if (!configRead('enableShorts') && isShortsShelf(shelve)) { shelves.splice(i, 1); continue; }
+      if (!configRead('enableShorts') && !shelve?.shelfRenderer) {
+        const allText = collectAllText(shelve).join(' ').toLowerCase();
+        if (/\bshorts?\b/i.test(allText)) { shelves.splice(i, 1); continue; }
+      }
+      // Confirmed via a device photo + the diagnostic below: the reported
+      // "full page" ad is a masthead-style hero banner (Kia/Audi/Garnier/
+      // Valentino, with a Gesponsert label, Ansehen button, and 3-tot menu)
+      // delivered as a top-level adSlotRenderer entry in the section list,
+      // sitting alongside regular shelfRenderer entries — invisible to
+      // every check below, which only ever handles shelve.shelfRenderer.
+      // Unlike a regular tile that might mix ad-adjacent properties with
+      // real content, adSlotRenderer unambiguously means "this whole entry
+      // is an ad" — safe to remove outright, same as the existing
+      // shorts-shelf removal just above.
+      if (shelve?.adSlotRenderer && configRead('enableAdBlock')) {
+        appendFileOnlyLog('shelf.adSlotRenderer.removed', { pageHint: activePage });
+        shelves.splice(i, 1);
+        continue;
+      }
+      if (!shelve.shelfRenderer) {
+        // Diagnostic: catches any other non-shelfRenderer entry that isn't
+        // the adSlotRenderer case above, in case there's more than one
+        // ad-delivery shape at this level. Deduped per distinct key set.
+        if (shelve && typeof shelve === 'object') {
+          const shelveKeySet = Object.keys(shelve).sort().join(',');
+          if (shelveKeySet !== _lastLoggedNonShelfKeySet) {
+            _lastLoggedNonShelfKeySet = shelveKeySet;
+            appendFileOnlyLog('shelf.nonShelfRenderer', { keys: Object.keys(shelve), pageHint: activePage });
+          }
+        }
+        continue;
+      }
+      // Thumbnail focus effects (upstream 9f450ca + 42ce789). YouTube TV grows
+      // the focused thumbnail; tvhtml5Style.effects controls that per shelf.
+      // The object is created when absent because plenty of shelves ship
+      // without it, and upstream found the setting silently did nothing on
+      // those. enlarge is forced off while shrink is forced on - opposite
+      // directions, so the two options are independent rather than duplicates.
+      if (!shelve.shelfRenderer.tvhtml5Style) shelve.shelfRenderer.tvhtml5Style = { effects: {} };
+      if (!shelve.shelfRenderer.tvhtml5Style.effects) shelve.shelfRenderer.tvhtml5Style.effects = {};
+      if (configRead('disableEnlargingThumbnails')) shelve.shelfRenderer.tvhtml5Style.effects.enlarge = false;
+      if (configRead('enableShrinkingThumbnails')) shelve.shelfRenderer.tvhtml5Style.effects.shrink = true;
+
+      let shelfItems = shelve?.shelfRenderer?.content?.horizontalListRenderer?.items;
+      if (!Array.isArray(shelfItems)) continue;
+      shelfItems = filterHiddenSpecialPlaylistTiles(shelfItems);
+      shelfItems = filterBadgedVideos(shelfItems, activePage);
+      stripCountsFromItems(shelfItems, activePage);
+      shelfItems = filterByKeyword(shelfItems, activePage);
+      shelfItems = filterHiddenChannels(shelfItems, activePage);
+      shelve.shelfRenderer.content.horizontalListRenderer.items = shelfItems;
+      deArrowify(shelfItems);
+      hqify(shelfItems);
+      addLongPress(shelfItems);
+      if (shouldAddPreviews) addPreviews(shelfItems);
+      shelve.shelfRenderer.content.horizontalListRenderer._originalRowSize = shelfItems.length;
+      shelve.shelfRenderer.content.horizontalListRenderer.items = hideVideo(shelfItems, activePage);
+      normalizeHorizontalListRenderer(shelve.shelfRenderer.content.horizontalListRenderer, `shelf:${activePage}:${i}`);
+      if (!configRead('enableShorts')) {
+        if (isShortsShelf(shelve)) { shelves.splice(i, 1); continue; }
+        const base = shelve?.richSectionRenderer?.content || shelve;
+        if (Array.isArray(base?.shelfRenderer?.content?.horizontalListRenderer?.items)) {
+          base.shelfRenderer.content.horizontalListRenderer.items = filterShortsFromItems(base.shelfRenderer.content.horizontalListRenderer.items, activePage);
+          base.shelfRenderer.content.horizontalListRenderer.items = base.shelfRenderer.content.horizontalListRenderer.items.filter(item => !item.tileRenderer?.onSelectCommand?.reelWatchEndpoint);
+          normalizeHorizontalListRenderer(base.shelfRenderer.content.horizontalListRenderer, `shelf:${activePage}:${i}:shorts`);
+        }
+        if (Array.isArray(base?.shelfRenderer?.content?.verticalListRenderer?.items)) base.shelfRenderer.content.verticalListRenderer.items = filterShortsFromItems(base.shelfRenderer.content.verticalListRenderer.items, activePage);
+        if (Array.isArray(base?.shelfRenderer?.content?.gridRenderer?.items)) base.shelfRenderer.content.gridRenderer.items = filterShortsFromItems(base.shelfRenderer.content.gridRenderer.items, activePage);
+        if (Array.isArray(base?.shelfRenderer?.content?.expandedShelfContentsRenderer?.items)) base.shelfRenderer.content.expandedShelfContentsRenderer.items = filterShortsFromItems(base.shelfRenderer.content.expandedShelfContentsRenderer.items, activePage);
+        if (Array.isArray(base?.richShelfRenderer?.content?.richGridRenderer?.contents)) base.richShelfRenderer.content.richGridRenderer.contents = filterShortsFromItems(base.richShelfRenderer.content.richGridRenderer.contents, activePage);
+        if (Array.isArray(base?.reelShelfRenderer?.items)) base.reelShelfRenderer.items = filterShortsFromItems(base.reelShelfRenderer.items, activePage);
+        const contentArrays = [
+          base?.shelfRenderer?.content?.horizontalListRenderer?.items,
+          base?.shelfRenderer?.content?.verticalListRenderer?.items,
+          base?.shelfRenderer?.content?.gridRenderer?.items,
+          base?.shelfRenderer?.content?.expandedShelfContentsRenderer?.items,
+          base?.richShelfRenderer?.content?.richGridRenderer?.contents,
+          base?.reelShelfRenderer?.items,
+        ].filter(arr => Array.isArray(arr));
+        if (contentArrays.length > 0 && contentArrays.every(arr => arr.length === 0)) { shelves.splice(i, 1); continue; }
+      }
+      if (shelve.shelfRenderer.content.horizontalListRenderer.items.length === 0) shelves.splice(i, 1);
+    } catch (shelfErr) { appendFileOnlyLog('processShelves.shelf.error', { index: i, msg: String(shelfErr?.message || shelfErr) }); }
+  }
+  // Before the duplicate hider, which removes the very repetitions that
+  // identify an aggregate row.
+  filterAggregateShelves(shelves, activePage);
+  // Last, so it sees shelves after every other filter — deduping earlier would
+  // let an ad or Shorts tile claim the "first occurrence" and hide the real one.
+  dedupeShelves(shelves, activePage);
+  logSubscriptionsShelfShape(shelves, activePage);
+}
+
+// ===== addPreviews =====
+
+function addPreviews(items) {
+  if (!configRead('enablePreviews')) return;
+  for (const item of items) {
+    try {
+      if (item.tileRenderer) {
+        const watchEndpoint = item.tileRenderer.onSelectCommand;
+        if (item.tileRenderer?.onFocusCommand?.playbackEndpoint) continue;
+        if (item.tileRenderer?.onFocusCommand?.commandExecutorCommand) continue;
+        item.tileRenderer.onFocusCommand = { startInlinePlaybackCommand: { blockAdoption: true, caption: false, delayMs: 3000, durationMs: 40000, muted: false, restartPlaybackBeforeSeconds: 10, resumeVideo: true, playbackEndpoint: watchEndpoint } };
+      }
+    } catch (_) { }
+  }
+}
+
+// ===== deArrowify =====
+
+function deArrowify(items) {
+  if (!Array.isArray(items)) return;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const item = items[i];
+    if (!item || typeof item !== 'object') continue;
+    if (item.adSlotRenderer) { items.splice(i, 1); continue; }
+    // Search results arrive as lockupViewModel instead of tileRenderer; both
+    // are handled, everything else is skipped.
+    const isLockup = isLockupVideo(item);
+    if (!item?.tileRenderer && !isLockup) continue;
+    if (!configRead('enableDeArrow')) continue;
+    const capturedItem = item;
+    const videoID = isLockup
+      ? String(lockupVideoId(capturedItem) || lockupWatchEndpoint(capturedItem)?.videoId || '')
+      : String(capturedItem.tileRenderer.contentId || capturedItem.tileRenderer.onSelectCommand?.watchEndpoint?.videoId || '');
+    if (!videoID || videoID.length !== 11) { appendFileOnlyLog('dearrow.skip', { reason: 'no_video_id', lockup: isLockup, contentId: (isLockup ? lockupVideoId(capturedItem) : capturedItem.tileRenderer.contentId) || null }); continue; }
+    _deArrowEnqueue(() =>
+      fetch(`https://sponsor.ajay.app/api/branding?videoID=${videoID}`)
+        .then(res => { if (!res.ok) return null; return res.json(); })
+        .then(data => {
+          if (!data) return;
+          if (Array.isArray(data.titles) && data.titles.length > 0) {
+            try {
+              const mostVoted = data.titles.reduce((max, title) => max.votes > title.votes ? max : title);
+              if (isLockup) setLockupTitle(capturedItem, mostVoted.title);
+              else capturedItem.tileRenderer.metadata.tileMetadataRenderer.title.simpleText = mostVoted.title;
+            } catch (_) { }
+          }
+          if (Array.isArray(data.thumbnails) && data.thumbnails.length > 0 && configRead('enableDeArrowThumbnails')) {
+            try {
+              const mostVotedThumbnail = data.thumbnails.reduce((max, thumbnail) => max.votes > thumbnail.votes ? max : thumbnail);
+              if (mostVotedThumbnail.timestamp !== null && mostVotedThumbnail.timestamp !== undefined) {
+                const dearrowThumb = [{ url: `https://dearrow-thumb.ajay.app/api/v1/getThumbnail?videoID=${videoID}&time=${mostVotedThumbnail.timestamp}`, width: 1280, height: 640 }];
+                if (isLockup) setLockupThumbnails(capturedItem, dearrowThumb);
+                else capturedItem.tileRenderer.header.tileHeaderRenderer.thumbnail.thumbnails = dearrowThumb;
+              }
+            } catch (_) { }
+          }
+        })
+        .catch(err => appendFileOnlyLog('dearrow.fetch.error', { videoID, msg: String(err?.message || err) }))
+    );
+  }
+}
+
+// ===== hqify =====
+
+function hqify(items) {
+  items.forEach((item, index) => {
+    try {
+      const isLockup = isLockupVideo(item);
+      if (!item.tileRenderer && !isLockup) return;
+      if (!isLockup && item.tileRenderer.style !== 'TILE_STYLE_YTLR_DEFAULT') return;
+      if (!configRead('enableHqThumbnails')) return;
+      const videoID = isLockup
+        ? (lockupVideoId(item) || lockupWatchEndpoint(item)?.videoId)
+        : item.tileRenderer.onSelectCommand?.watchEndpoint?.videoId;
+      if (!videoID) return;
+      // Both shapes keep their image list as a plain array, so the in-place
+      // upgrade below (hqdefault now, sddefault once the HEAD probe confirms
+      // it exists) works the same either way.
+      const thumbs = isLockup
+        ? lockupThumbnails(item)
+        : item.tileRenderer.header?.tileHeaderRenderer?.thumbnail?.thumbnails;
+      if (!thumbs || !thumbs[0]?.url) return;
+      thumbs[0] = { url: `https://i.ytimg.com/vi/${videoID}/hqdefault.jpg`, width: 480, height: 360 };
+      setTimeout(() => {
+        fetch(`https://i.ytimg.com/vi/${videoID}/sddefault.jpg`, { method: 'HEAD' })
+          .then(res => { if (res.ok) thumbs[0] = { url: `https://i.ytimg.com/vi/${videoID}/sddefault.jpg`, width: 640, height: 480 }; })
+          .catch(() => {});
+      }, index * 50);
+    } catch (_) { }
+  });
+}
+
+// ===== addLongPress =====
+
+// ===== Not interested / Don't recommend channel (upstream 137ab52d) =====
+//
+// YouTube stopped embedding the feedback tokens in the long press menu. They
+// now arrive as an engagement panel reference (panelId + params) that has to be
+// fetched through /youtubei/v1/get_panel before the tokens can be used, which
+// is why both entries simply vanished from the menu. Upstream's port of the
+// SmartTube fix puts them back: the entries are added here, and the fetching
+// and sending happen on click, in resolveCommand.js.
+
+// Reported: neither feedback entry shows up. They are only added when the item
+// carries the panel reference YouTube now sends instead of the tokens, so the
+// question is where that reference sits — upstream reads exactly two places.
+// This looks in those first and then searches the item, since a reference that
+// moved one level is indistinguishable from one that is absent, and both end as
+// a menu with nothing in it.
+const FEEDBACK_SEARCH_DEPTH = 8;
+
+function readPanelEndpoint(endpoint) {
+  if (endpoint?.identifier?.tag && endpoint?.globalConfiguration?.params) {
+    return { panelId: endpoint.identifier.tag, params: endpoint.globalConfiguration.params };
+  }
+  return null;
+}
+
+function findPanelAnywhere(node, depth) {
+  if (!node || typeof node !== 'object' || depth > FEEDBACK_SEARCH_DEPTH) return null;
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const hit = findPanelAnywhere(child, depth + 1);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  const direct = readPanelEndpoint(node.showEngagementPanelEndpoint);
+  if (direct) return direct;
+  for (const key of Object.keys(node)) {
+    // Never follow an action's parameters: this fork's own entries keep a copy
+    // of the whole video item there, panel reference included, which would make
+    // every item look like it had one of its own.
+    if (key === 'parameters') continue;
+    const hit = findPanelAnywhere(node[key], depth + 1);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+// One line per distinct shape, so a capture shows whether the reference is
+// there at all and where — the difference between "YouTube stopped sending it"
+// and "we looked in the wrong place".
+const _loggedFeedbackShapes = new Set();
+
+function getFeedbackPanel(item) {
+  const onLongPress = item?.tileRenderer
+    ? item.tileRenderer.onLongPressCommand
+    : item?.lockupViewModel?.rendererContext?.commandContext?.onLongPress;
+  const known = readPanelEndpoint(onLongPress?.showEngagementPanelEndpoint)
+    || readPanelEndpoint(onLongPress?.innertubeCommand?.showEngagementPanelEndpoint);
+  const panel = known || findPanelAnywhere(item, 0);
+  try {
+    const shape = (item?.tileRenderer ? 'tile' : 'lockup')
+      + '|' + Object.keys(onLongPress || {}).sort().join(',')
+      + '|' + (known ? 'known' : panel ? 'searched' : 'none');
+    if (!_loggedFeedbackShapes.has(shape) && _loggedFeedbackShapes.size < 20) {
+      _loggedFeedbackShapes.add(shape);
+      appendFileOnlyLog('addLongPress.feedbackPanel', {
+        where: known ? 'onLongPressCommand' : panel ? 'elsewhere in the item' : 'not found',
+        itemShape: item?.tileRenderer ? 'tileRenderer' : 'lockupViewModel',
+        longPressKeys: Object.keys(onLongPress || {}),
+      });
+    }
+  } catch (_) { }
+  return panel;
+}
+// Whether the menu already offers feedback, from either source.
+//
+// Two differences from upstream here, both of which only show up in this fork.
+// Upstream looks for a feedback TOKEN, but the entries restored below carry no
+// token — the panel is fetched on click — so a second pass over the same item
+// added them a second time. And it searches the whole endpoint, while this
+// fork's own entries (Add to Queue, Go To Channel) embed a copy of the entire
+// video item in their parameters; that copy can contain a token of its own, and
+// finding it suppressed the real entries entirely.
+function menuHasFeedbackAction(menuItems, actionName) {
+  if (!Array.isArray(menuItems)) return false;
+  return menuItems.some((menuItem) => {
+    const endpoint = menuItem?.menuServiceItemRenderer?.serviceEndpoint
+      || menuItem?.menuNavigationItemRenderer?.navigationEndpoint;
+    if (!endpoint) return false;
+    const action = endpoint.customAction?.action || endpoint.playlistEditEndpoint?.customAction?.action;
+    return action === actionName;
+  });
+}
+
+// A token on the endpoint itself, never one inside an action's parameters.
+function hasOwnFeedbackToken(value, depth) {
+  if (!value || typeof value !== 'object' || depth > 8) return false;
+  if (typeof value.feedbackToken === 'string') return true;
+  for (const key of Object.keys(value)) {
+    if (key === 'parameters') continue;
+    if (hasOwnFeedbackToken(value[key], depth + 1)) return true;
+  }
+  return false;
+}
+function feedbackMenuItems(panel) {
+  return [
+    tagMenuItem('notInterested', MenuServiceItemRenderer(t('videoMenu.notInterested'), {
+      clickTrackingParams: null,
+      customAction: { action: 'NOT_INTERESTED', parameters: panel }
+    })),
+    tagMenuItem('dontRecommendChannel', MenuServiceItemRenderer(t('videoMenu.dontRecommendChannel'), {
+      clickTrackingParams: null,
+      customAction: { action: 'DONT_RECOMMEND_CHANNEL', parameters: panel }
+    }))
+  ];
+}
+
+// Restores the feedback entries and then applies the user's order and hiding.
+// Called from every path that builds or extends a long press menu, which is why
+// the preferences are applied here rather than in each of them: the feedback
+// entries are appended after the menu is otherwise finished, so applying them
+// any earlier would leave those two stuck at the end.
+function finishLongPressMenu(item, menuItems) {
+  try {
+    const panel = getFeedbackPanel(item);
+    if (panel && Array.isArray(menuItems)) {
+      // Check each action independently: YouTube can supply one feedback item
+      // without the other. A single existing action must not suppress both.
+      const existingNotInterested = menuHasFeedbackAction(menuItems, 'NOT_INTERESTED');
+      const existingDontRecommend = menuHasFeedbackAction(menuItems, 'DONT_RECOMMEND_CHANNEL');
+      for (const feedbackItem of feedbackMenuItems(panel)) {
+        const action = feedbackItem?.menuServiceItemRenderer?.serviceEndpoint?.customAction?.action;
+        if (action === 'NOT_INTERESTED' && !existingNotInterested) menuItems.push(feedbackItem);
+        if (action === 'DONT_RECOMMEND_CHANNEL' && !existingDontRecommend) menuItems.push(feedbackItem);
+      }
+    }
+    applyMenuPreferences(menuItems);
+  } catch (err) {
+    appendFileOnlyLog('addLongPress.feedback.error', { message: err?.message || String(err) });
+  }
+}
+
+let _lastLoggedNonVideoTileKeys = null;
+// Once per page: the shape is what is worth knowing, not the count.
+let _loggedTileWithoutLines = false;
+
+/**
+ * A playlist tile or a channel tile, told apart by what opens it.
+ *
+ * Both open with a browseEndpoint rather than a watchEndpoint, which is why
+ * neither has ever been given a long press menu here. The id says which is
+ * which: a channel's is UC…, a playlist's browse id is its playlist id with VL
+ * in front, and Watch Later and Liked appear as plain WL and LL on the tile's
+ * contentId.
+ *
+ * Both endpoint shapes seen on device are read. A capture from both TVs showed
+ * non-video tiles arriving as either {clickTrackingParams, browseEndpoint} or
+ * {clickTrackingParams, commandExecutorCommand} — channelShelfHider.js already
+ * reads the second for the same reason.
+ *
+ * Anything else — a topic tile, a Shorts tile, FEsubscriptions — comes back
+ * null and falls through to the existing handling untouched. Round topic tiles
+ * ("Palworld – Thema") in particular must not be mistaken for channels, which
+ * is why this keys on the id and not on the tile's round style.
+ */
+// Signatures of tiles already reported as rejected, so a shelf of a hundred
+// tiles of the same shape logs once. Capped because the set is keyed partly on
+// an id prefix and a long session should not be able to grow it without bound.
+const _rejectedTiles = new Set();
+const MAX_REJECTED_LOGGED = 40;
+
+function noteRejectedTile(signature, payload) {
+  if (_rejectedTiles.has(signature) || _rejectedTiles.size >= MAX_REJECTED_LOGGED) return;
+  _rejectedTiles.add(signature);
+  appendFileOnlyLog('addLongPress.browseTileRejected', payload);
+}
+
+function browseTileInfo(item) {
+  const tile = item?.tileRenderer;
+  if (!tile) return null;
+  const select = tile.onSelectCommand;
+  // A video is never one of these, and asking first is not just an early out.
+  // The id falls back to contentId for tiles that carry it there, and a video's
+  // contentId is its video id — an 11-character id that happens to begin with
+  // VL would otherwise be read as a playlist and handed the wrong menu.
+  if (select?.watchEndpoint || select?.reelWatchEndpoint) return null;
+  const commands = select?.commandExecutorCommand?.commands;
+  const browseId = select?.browseEndpoint?.browseId
+    || (Array.isArray(commands) ? commands.map(c => c?.browseEndpoint?.browseId).find(Boolean) : null)
+    || tile.contentId
+    || '';
+  const id = String(browseId).trim();
+  if (!id) {
+    // A tile with no browse id anywhere this looks. If the library's playlist
+    // tiles turn out to be shaped differently from the ones that work, this is
+    // the line that says so, and the select command's keys say where the id
+    // went instead.
+    noteRejectedTile('noid:' + Object.keys(select || {}).sort().join(','), {
+      reason: 'noBrowseId',
+      select: Object.keys(select || {}),
+      nested: Array.isArray(commands) ? commands.map(c => Object.keys(c || {})[0] || '?') : null,
+      style: tile.style || null,
+      page: detectCurrentPage(),
+    });
+    return null;
+  }
+  const title = tile.metadata?.tileMetadataRenderer?.title?.simpleText || '';
+  const thumbnails = tile.header?.tileHeaderRenderer?.thumbnail?.thumbnails || [];
+
+  if (/^UC[\w-]{10,}$/.test(id)) return { kind: 'channel', id, title, thumbnails };
+  // VL-prefixed, or the two special playlists as they appear on a tile.
+  const upper = id.toUpperCase();
+  if (/^VL./.test(upper) || upper === 'WL' || upper === 'LL') {
+    return { kind: 'playlist', id, title, thumbnails };
+  }
+  // An id that is neither a channel nor a playlist by these rules. Mostly
+  // topic and FE tiles, which is correct and expected — but if a library
+  // playlist ever arrives with an unprefixed id, it lands here silently, and
+  // the prefix alone is enough to recognise that without logging whole ids.
+  noteRejectedTile('id:' + id.slice(0, 4), {
+    reason: 'unrecognisedId',
+    idPrefix: id.slice(0, 4),
+    length: id.length,
+    style: tile.style || null,
+    page: detectCurrentPage(),
+  });
+  return null;
+}
+
+function addLongPress(items) {
+  if (!Array.isArray(items)) return;
+  for (const item of items) {
+    try {
+      // lockupViewModel items (search results) carry their long-press command
+      // under rendererContext.commandContext instead of onLongPressCommand.
+      if (isLockupVideo(item)) {
+        const existingMenu = lockupLongPressMenuItems(item);
+        if (existingMenu) {
+          existingMenu.push(tagMenuItem('queue', MenuServiceItemRenderer(t('videoMenu.addToQueue'), { clickTrackingParams: null, playlistEditEndpoint: { customAction: { action: 'ADD_TO_QUEUE', parameters: item } } })));
+          finishLongPressMenu(item, existingMenu);
+          continue;
+        }
+        if (!configRead('enableLongPress')) continue;
+        const watchEndpointData = lockupWatchEndpoint(item);
+        const thumbnails = lockupThumbnails(item);
+        const title = lockupTitle(item);
+        if (!watchEndpointData || !thumbnails || !title) continue;
+        // Lockup metadata rows are plain strings, not runs/simpleText nodes.
+        const lockupData = longPressData({
+          videoId: lockupVideoId(item),
+          thumbnails,
+          title,
+          subtitle: lockupSubtitle(item) || '',
+          watchEndpointData,
+          item,
+        });
+        finishLongPressMenu(item, lockupData.showMenuCommand.menu.menuRenderer.items);
+        setLockupLongPress(item, lockupData);
+        continue;
+      }
+      if (!item?.tileRenderer) {
+        // Diagnostic: the TILE_STYLE_YTLR_ROUND check found only channel
+        // avatar tiles, not the reported promoted/sponsored tile — it very
+        // likely uses a completely different top-level renderer key than
+        // tileRenderer entirely (would explain why it's invisible to every
+        // per-item function in this file, all of which only ever check
+        // item.tileRenderer). Deduped by the item's own top-level key set
+        // so it logs once per distinct renderer type seen, not once per
+        // item.
+        if (item && typeof item === 'object') {
+          const itemKeySet = Object.keys(item).sort().join(',');
+          if (itemKeySet !== _lastLoggedNonTileKeySet) {
+            _lastLoggedNonTileKeySet = itemKeySet;
+            appendFileOnlyLog('shelfItem.nonTileRenderer', { keys: Object.keys(item) });
+          }
+        }
+        continue;
+      }
+      // A playlist or channel tile gets its own small menu, before the style
+      // check: a channel avatar is a round tile, which that check turns away.
+      // Only when the tile has no menu of its own — YouTube's own menu is left
+      // alone here as everywhere else — and only when there is something to
+      // put in it, so a tile never gains a menu that opens empty.
+      if (configRead('enableLongPress') && !item.tileRenderer.onLongPressCommand) {
+        const browseInfo = browseTileInfo(item);
+        if (browseInfo) {
+          const browseMenu = browseTileLongPressData(browseInfo);
+          if (browseMenu) {
+            item.tileRenderer.onLongPressCommand = browseMenu;
+            // Reported: these menus attach — 110 playlist tiles in one
+            // capture — and long pressing a playlist in the library still
+            // shows nothing, while the same menu on a channel tile and the
+            // video menu on a video both work. So the attachment is not the
+            // question any more and the tile is. The style is the first
+            // suspect, since the video path only ever ran for
+            // TILE_STYLE_YTLR_DEFAULT and VERTICAL_LIST, and a capture has
+            // shown library tiles in SQUARE and ROUND as well — a style whose
+            // component never binds the gesture would look exactly like this.
+            // Logged with the page and whether the thumbnail came through,
+            // because an empty thumbnail is the other way the dialog could
+            // fail to draw.
+            appendFileOnlyLog('addLongPress.browseTile', {
+              kind: browseInfo.kind,
+              id: browseInfo.id,
+              entries: browseMenu.showMenuCommand.menu.menuRenderer.items.length,
+              // Which ones, not just how many. A count alone could not
+              // distinguish a menu that was built short from one the user's
+              // own long press settings had filtered, and that distinction
+              // was the answer: entries reusing the video menu's ids were
+              // being removed by its hidden list.
+              ids: browseMenu.showMenuCommand.menu.menuRenderer.items.map((entry) => (entry && entry.__ttMenuId) || null),
+              style: item.tileRenderer.style || null,
+              page: detectCurrentPage(),
+              thumbs: (browseInfo.thumbnails || []).length,
+              select: Object.keys(item.tileRenderer.onSelectCommand || {}),
+            });
+          }
+          continue;
+        }
+      }
+      if (item.tileRenderer.style !== 'TILE_STYLE_YTLR_DEFAULT' && item.tileRenderer.style !== 'TILE_STYLE_YTLR_VERTICAL_LIST') {
+        // Diagnostic: reported promoted/sponsored video tiles (label +
+        // Watch button + 3-dot "hide ad" menu) embedded inside normal
+        // shelves aren't handled anywhere in this file. An unusual tile
+        // style here is a plausible signal for that — logging the shape
+        // (not the full tile, to stay cheap) so the actual structure can
+        // be seen on the next capture instead of guessing blind.
+        appendFileOnlyLog('tile.unknownStyle', {
+          style: item.tileRenderer.style,
+          hasMenu: !!item.tileRenderer.onLongPressCommand,
+          title: item.tileRenderer.metadata?.tileMetadataRenderer?.title?.simpleText || null,
+          keys: Object.keys(item.tileRenderer),
+        });
+        continue;
+      }
+      if (item.tileRenderer.onLongPressCommand?.showMenuCommand) {
+        item.tileRenderer.onLongPressCommand.showMenuCommand?.menu?.menuRenderer?.items?.push(tagMenuItem('queue', MenuServiceItemRenderer(t('videoMenu.addToQueue'), { clickTrackingParams: null, playlistEditEndpoint: { customAction: { action: 'ADD_TO_QUEUE', parameters: item } } })));
+        finishLongPressMenu(item, item.tileRenderer.onLongPressCommand.showMenuCommand?.menu?.menuRenderer?.items);
+        continue;
+      }
+      if (!configRead('enableLongPress')) continue;
+      if (!item.tileRenderer?.metadata?.tileMetadataRenderer) continue;
+      // Reported from History: a playlist tile was given the video menu.
+      // A playlist opens with a browseEndpoint and has no watchEndpoint, so
+      // every entry built from one acts on an id that is not a video. The
+      // lockup branch above already refuses these; this one never did.
+      if (!item.tileRenderer.onSelectCommand?.watchEndpoint) {
+        const selectKeys = Object.keys(item.tileRenderer.onSelectCommand || {}).sort().join(',');
+        if (selectKeys !== _lastLoggedNonVideoTileKeys) {
+          _lastLoggedNonVideoTileKeys = selectKeys;
+          appendFileOnlyLog('tile.notAVideo', { select: Object.keys(item.tileRenderer.onSelectCommand || {}) });
+        }
+        continue;
+      }
+      // Reached blind before, and some tiles carry no metadata lines at all:
+      //
+      //   addLongPress.item.error {"message":"Cannot read property '0' of undefined"}
+      //
+      // Six of those inside one second in a capture. The throw was caught and
+      // the tile skipped, which was the right outcome, but it was reached by
+      // way of an exception and a log line — and a log line emitted inside a
+      // response costs this TV real time. Checking is cheaper than catching.
+      const subtitleNode = item.tileRenderer.metadata.tileMetadataRenderer.lines?.[0]
+        ?.lineRenderer?.items?.[0]?.lineItemRenderer?.text;
+      if (!subtitleNode) {
+        if (!_loggedTileWithoutLines) {
+          _loggedTileWithoutLines = true;
+          appendFileOnlyLog('tile.noMetadataLines', {
+            style: item.tileRenderer.style || null,
+            metadataKeys: Object.keys(item.tileRenderer.metadata.tileMetadataRenderer || {}),
+          });
+        }
+        continue;
+      }
+      const subtitle = subtitleNode;
+      const data = longPressData({ videoId: item.tileRenderer.contentId, thumbnails: item.tileRenderer.header.tileHeaderRenderer.thumbnail.thumbnails, title: item.tileRenderer.metadata.tileMetadataRenderer.title.simpleText, subtitle: subtitle.runs ? subtitle.runs[0].text : subtitle.simpleText, watchEndpointData: item.tileRenderer.onSelectCommand.watchEndpoint, item });
+      finishLongPressMenu(item, data.showMenuCommand.menu.menuRenderer.items);
+      item.tileRenderer.onLongPressCommand = data;
+    } catch (error) { appendFileOnlyLog('addLongPress.item.error', { message: error?.message || String(error) }); }
+  }
+}

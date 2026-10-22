@@ -1,0 +1,291 @@
+import { configRead } from '../config.js';
+import { deviceNameForSyslog, asHostField } from './deviceName.js';
+
+/**
+ * syslog.js — RFC 5424 output, independent of the existing log server.
+ *
+ * Deliberately kept separate from logServer.js rather than replacing it: the
+ * PS1 receiver path is what currently works on-device, so syslog is added
+ * alongside it. Either can be on without the other, and a broken syslog
+ * target cannot stop the log server from delivering.
+ *
+ * The page cannot speak syslog itself. Syslog is UDP (or TCP), and this code
+ * runs in a browser context — Cobalt blocks raw sockets, and logServer.js
+ * already documents that even XHR and WebSocket are unavailable from the
+ * HTTPS YouTube page. So the page formats the message and a Node process
+ * emits the datagram:
+ *
+ *   proxy path (page served from localhost:8099)
+ *       → POST /tizentube/syslog on the standalone service, which sends UDP
+ *
+ *   CDP path (page is real youtube.com) and TizenBrew
+ *       → window.__ttSyslogQueue, drained over the CDP connection that is
+ *         already open, then sent from the service side
+ *
+ * Format (RFC 5424):
+ *   <PRI>1 TIMESTAMP HOSTNAME APP-NAME PROCID MSGID STRUCTURED-DATA MSG
+ *
+ * The label ("playlist.batch_collect.fetching") maps onto MSGID, which means
+ * a syslog server can filter by feature the same way the in-app log
+ * categories do.
+ */
+
+const SYSLOG_VERSION = 1;
+const NILVALUE = '-';
+
+// Keep a datagram comfortably inside the ~1KB that is safe to assume for UDP
+// syslog without path MTU discovery. Longer messages are split, with the part
+// marker carried in structured data rather than glued into the text so the
+// message itself stays parseable.
+const MAX_MSG_BYTES = 900;
+
+// RFC 5424 severities. The codebase only ever emits INFO/WARN/ERROR/DEBUG.
+const SEVERITY = {
+  EMERG: 0, ALERT: 1, CRIT: 2, ERROR: 3, ERR: 3,
+  WARN: 4, WARNING: 4, NOTICE: 5, INFO: 6, DEBUG: 7,
+};
+
+export function isSyslogEnabled() {
+  try { return !!configRead('syslogEnabled') && !!configRead('syslogHost'); } catch { return false; }
+}
+
+function severityFor(level) {
+  const key = String(level || 'INFO').toUpperCase();
+  return SEVERITY[key] === undefined ? SEVERITY.INFO : SEVERITY[key];
+}
+
+// PRI = facility * 8 + severity. Facility defaults to 16 (local0), the
+// conventional range for application-defined use.
+function priority(level) {
+  let facility = Number(configRead('syslogFacility'));
+  if (!Number.isFinite(facility) || facility < 0 || facility > 23) facility = 16;
+  return (facility * 8) + severityFor(level);
+}
+
+// PRINTUSASCII, no spaces, no '=', ']' or '"'. Anything else is dropped so a
+// malformed field can't break the frame for the receiver.
+function sanitize(value, max) {
+  const out = String(value == null ? '' : value).replace(/[^\x21-\x7E]/g, '').replace(/[\]="]/g, '');
+  if (!out) return NILVALUE;
+  return out.slice(0, max);
+}
+
+/**
+ * The HOSTNAME field: which TV this came from.
+ *
+ * Reported: a syslog server names its files after this field, and it was
+ * sending the page's own host — so everything landed in one file called
+ * syslog-www.youtube.com.log, which says neither which TV nor that it is one.
+ *
+ * The TV's model is what a person would call it, and the page can usually
+ * reach it (see deviceName.js). Anything the user typed in the settings wins
+ * over that, and the app's name is the last resort — still better than the
+ * host of a page that is the same on every TV in the house.
+ */
+function hostname() {
+  try {
+    // Through the same reduction as the detected name and as the service's
+    // own, so a typed name cannot be the one thing that splits a TV's lines
+    // across two names in the same file.
+    const configured = asHostField(configRead('syslogHostname'));
+    if (configured) return configured;
+  } catch (_) { }
+  try {
+    const device = deviceNameForSyslog();
+    if (device) return sanitize(device, 255);
+  } catch (_) { }
+  return 'TizenTube';
+}
+
+function structuredData(entry, part, totalParts) {
+  const pairs = [];
+  if (entry.context) pairs.push(`context="${String(entry.context).replace(/["\\\]]/g, '')}"`);
+  if (totalParts > 1) pairs.push(`part="${part}" parts="${totalParts}"`);
+  if (!pairs.length) return NILVALUE;
+  return `[tizentube@0 ${pairs.join(' ')}]`;
+}
+
+/**
+ * Build one RFC 5424 frame.
+ *
+ * @param {object} entry  { ts, level, context, label, message }
+ * @param {string} message the (possibly chunked) message text
+ */
+export function formatSyslog(entry, message, part = 1, totalParts = 1) {
+  const ts = entry.ts || new Date().toISOString();
+  const appName = sanitize(configRead('syslogAppName') || 'TizenTube', 48);
+  const msgId = sanitize(entry.label || 'log', 32);
+  return `<${priority(entry.level)}>${SYSLOG_VERSION} ${ts} ${hostname()} ${appName} ${NILVALUE} ${msgId} ${structuredData(entry, part, totalParts)} ${message}`;
+}
+
+// Why the sends are queued instead of fired where they are asked for.
+//
+// A capture with per-region checkpoints put the cost of a response squarely on
+// regions whose only real work is one log line:
+//
+//   ms=297 detectMs=296  watch  {data,expiration,creation}
+//   ms=184 diagMs=183    home   {brand,model,year,os,...}
+//   ms=179 diagMs=178    home   {responseContext}
+//
+// Those objects have nothing to filter and nativeMs was 0. What they have in
+// common is being a response shape seen for the first time, which is exactly
+// what makes the deduped diagnostics emit a line. So one log line was costing
+// something like 180-300ms on this TV, and on the proxy path each line fired
+// two of these: one here and one from the other transport.
+//
+// The fetches are asynchronous and still cost that much, so whatever is
+// expensive about them happens before they return — building the request on
+// the whatwg-fetch polyfill over Cobalt's XHR, most likely. Rather than guess
+// at which part, nothing is sent from the caller any more: the frame goes on a
+// queue, and a timer drains it. The caller pays for an array push.
+//
+// This is also why two correlations between log VOLUME and parse cost came
+// back flat. The cost is not lines per second; it is whether a line is emitted
+// while a response is being processed, and the busiest log stretches were
+// steady playback, which emits no new shapes at all.
+
+// How often the queue is drained, and how many go out per tick. Spreading them
+// matters as much as deferring them: a hundred requests in one tick would
+// block the thread just as thoroughly, only later.
+const PROXY_FLUSH_MS = 250;
+const PROXY_PER_TICK = 10;
+const MAX_PROXY_QUEUE = 200;
+
+let _proxyQueue = [];
+let _proxyTimer = null;
+
+function flushProxyQueue() {
+  _proxyTimer = null;
+  const batch = _proxyQueue.splice(0, PROXY_PER_TICK);
+  for (let i = 0; i < batch.length; i++) {
+    const item = batch[i];
+    try {
+      fetch('http://localhost:8099/tizentube/syslog', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ host: item.host, port: item.port, frame: item.frame }),
+      }).catch(function () { });
+    } catch (_) { }
+  }
+  if (_proxyQueue.length) scheduleProxyFlush();
+}
+
+function scheduleProxyFlush() {
+  if (_proxyTimer) return;
+  try {
+    _proxyTimer = setTimeout(flushProxyQueue, PROXY_FLUSH_MS);
+  } catch (_) {
+    _proxyTimer = null;
+  }
+}
+
+function queueProxySend(item) {
+  // Oldest first when full: during a flood the newest lines are the ones being
+  // looked for.
+  if (_proxyQueue.length >= MAX_PROXY_QUEUE) _proxyQueue.shift();
+  _proxyQueue.push(item);
+  scheduleProxyFlush();
+}
+
+// Mirrors logServer.js's cap so a stuck relay can't grow this without bound.
+const MAX_QUEUE = 100;
+
+function queue(frame, host, port) {
+  if (!Array.isArray(window.__ttSyslogQueue)) window.__ttSyslogQueue = [];
+  if (window.__ttSyslogQueue.length < MAX_QUEUE) {
+    window.__ttSyslogQueue.push({ frame, host, port });
+  }
+}
+
+// Reported once per page load, so a capture shows which route frames took and
+// whether a host was even configured. Without this, syslog failing looked
+// identical to syslog not running — there was nothing logged on either side.
+let _deliveryPathLogged = false;
+
+function noteDeliveryPath(path, host, port) {
+  if (_deliveryPathLogged) return;
+  _deliveryPathLogged = true;
+  // Deliberately console rather than appendFileOnlyLog: that function is what
+  // calls into here, and routing this back through it would recurse.
+  try {
+    console.info(`[TizenTube] syslog delivery via ${path} -> ${host}:${port}`);
+  } catch (_) { }
+}
+
+function deliver(frame) {
+  const host = configRead('syslogHost');
+  const port = Number(configRead('syslogPort')) || 514;
+  if (!host) {
+    if (!_deliveryPathLogged) {
+      _deliveryPathLogged = true;
+      try { console.warn('[TizenTube] syslog is enabled but no Syslog Server IP is set; nothing will be sent'); } catch (_) { }
+    }
+    return false;
+  }
+
+  // Same-origin plain HTTP: the standalone service can be reached directly.
+  if (window.location.hostname === 'localhost') {
+    noteDeliveryPath('proxy POST', host, port);
+    try {
+      queueProxySend({ host: host, port: port, frame: frame });
+      return true;
+    } catch (_) {
+      // fall through to the queue
+    }
+  }
+
+  // HTTPS page: a fetch to http://localhost is cross-origin and mixed
+  // content, which Cobalt blocks outright. Queue for the CDP drain instead.
+  //
+  // Note the dependency this creates: the queue is drained by injector.js over
+  // the CDP connection, so frames only leave the TV once injection has
+  // succeeded AND the installed .wgt contains a service that knows how to send
+  // them. A page updated from the CDN against an older .wgt will queue frames
+  // that nothing ever drains.
+  noteDeliveryPath('CDP queue', host, port);
+  queue(frame, host, port);
+  return true;
+}
+
+export function sendSyslog(entry) {
+  if (!isSyslogEnabled()) return false;
+  return sendSyslogFrame(entry);
+}
+
+/** Build and deliver, without the enabled check. Used by the test button. */
+function sendSyslogFrame(entry) {
+  try {
+    const message = String((entry && entry.message) || '');
+    if (message.length <= MAX_MSG_BYTES) return deliver(formatSyslog(entry, message));
+
+    const totalParts = Math.ceil(message.length / MAX_MSG_BYTES);
+    let sent = false;
+    for (let i = 0; i < totalParts; i++) {
+      const chunk = message.slice(i * MAX_MSG_BYTES, (i + 1) * MAX_MSG_BYTES);
+      if (deliver(formatSyslog(entry, chunk, i + 1, totalParts))) sent = true;
+    }
+    return sent;
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * Send a one-off frame so the user can confirm the receiver is listening,
+ * matching the log server's own "Test Connection" button.
+ */
+export function sendSyslogTest() {
+  // Sent whether or not syslog output is enabled, matching the log server's
+  // test button: verifying the host and port BEFORE switching output on is the
+  // whole point of a test, and refusing until it is already on made it useless
+  // for that.
+  if (!configRead('syslogHost')) return { enabled: !!configRead('syslogEnabled'), queued: false, noHost: true };
+  const queued = sendSyslogFrame({
+    ts: new Date().toISOString(),
+    level: 'INFO',
+    context: 'TizenTube',
+    label: 'syslog.test',
+    message: 'Manual syslog test frame',
+  });
+  return { enabled: !!configRead('syslogEnabled'), queued };
+}

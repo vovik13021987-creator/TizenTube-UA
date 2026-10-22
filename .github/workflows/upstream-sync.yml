@@ -1,0 +1,173 @@
+# Watch reisxd/TizenTube for new commits and open a PR that carries them.
+#
+# This fork has rewritten large parts of mods/ (adblock.js, hideWatched.js,
+# settings.js in particular), so most upstream commits touching those files
+# WILL conflict. The workflow does not pretend otherwise: it always produces a
+# branch that merges cleanly into main, and when a file conflicted it keeps the
+# fork's version and says so in the PR body, so the upstream change can be
+# hand-ported afterwards.
+name: Upstream sync
+
+on:
+  #schedule:
+    # 04:20 UTC daily — outside the usual release window.
+    #- cron: '20 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/reisxd/TizenTube.git
+  UPSTREAM_BRANCH: main
+  UPSTREAM_BRANCH_REF: upstream/main
+  SYNC_BRANCH: sync/upstream
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Clone repo with full history
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Fetch upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM_REPO" 2>/dev/null || git remote set-url upstream "$UPSTREAM_REPO"
+          git fetch upstream "$UPSTREAM_BRANCH" --no-tags
+
+      - name: Check for new upstream commits
+        id: check
+        run: |
+          set -euo pipefail
+          COUNT=$(git rev-list --count "origin/main..upstream/${UPSTREAM_BRANCH}")
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Upstream commits not in main: $COUNT"
+
+      - name: Merge upstream, keeping the fork's side of any conflict
+        id: merge
+        if: steps.check.outputs.count != '0'
+        run: |
+          set -euo pipefail
+          BASE_SHA=$(git rev-parse origin/main)
+          git checkout -B "$SYNC_BRANCH" origin/main
+
+          # --no-commit so the CI-exclusion below lands in the same commit
+          # whether or not the merge conflicted, rather than needing a second.
+          CONFLICTS=""
+          git merge --no-commit --no-ff "$UPSTREAM_BRANCH_REF" || true
+
+          CONFLICTS=$(git diff --name-only --diff-filter=U || true)
+          if [ -n "$CONFLICTS" ]; then
+            # Keep this fork's version of every conflicted file. The point of
+            # the PR is to surface the change for review, not to guess at a
+            # resolution — committing conflict markers would only produce a
+            # branch that cannot build.
+            echo "Conflicted files kept at fork version:"
+            echo "$CONFLICTS"
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              git checkout --ours -- "$f" 2>/dev/null || git rm -q -- "$f"
+              git add -- "$f" 2>/dev/null || true
+            done <<< "$CONFLICTS"
+          fi
+
+          # CI is never synced from upstream, for two reasons. This fork runs
+          # its own workflows (npm publish, standalone .wgt build, this sync)
+          # which have no upstream counterpart, so importing theirs would be
+          # actively wrong. And GITHUB_TOKEN *cannot* push changes under
+          # .github/workflows at all — there is no "workflows" permission in
+          # the permissions: block, that scope exists only for PATs and GitHub
+          # Apps, so a push carrying one is rejected outright:
+          #   refusing to allow a GitHub App to create or update workflow
+          #   `.github/workflows/...` without `workflows` permission
+          # Restoring the directory to exactly origin/main covers both the
+          # modified and the newly-added case.
+          if git rev-parse --verify -q "${BASE_SHA}:.github/workflows" >/dev/null; then
+            git rm -rf --quiet --ignore-unmatch .github/workflows >/dev/null 2>&1 || true
+            git checkout "$BASE_SHA" -- .github/workflows
+            git add -A .github/workflows
+            echo "Restored .github/workflows to the fork's version"
+          fi
+
+          # A clean merge leaves everything staged but uncommitted because of
+          # --no-commit; a conflicted one is staged by the loop above.
+          git commit --no-edit || echo "Nothing to commit"
+
+          {
+            echo 'conflicts<<TT_EOF'
+            echo "$CONFLICTS"
+            echo 'TT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          if git diff --quiet origin/main -- .; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git push --force-with-lease origin "$SYNC_BRANCH"
+          fi
+
+      - name: Open or update the sync PR
+        if: steps.check.outputs.count != '0' && steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # gh resolves the base repository of a fork to its PARENT, so these
+          # commands ran against reisxd/TizenTube — where this token has no
+          # access. That is the whole failure:
+          #   pull request create failed: GraphQL: Resource not accessible by
+          #   integration (createPullRequest)
+          # It also meant `gh pr list` never found the existing sync PR, so every
+          # run tried to create a new one. GH_REPO pins all three to this fork.
+          GH_REPO: ${{ github.repository }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+          NEW_COMMITS: ${{ steps.check.outputs.count }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "Automated sync with [reisxd/TizenTube](https://github.com/reisxd/TizenTube) — **${NEW_COMMITS}** new upstream commit(s)."
+            echo
+
+            if [ -n "${CONFLICTS//[[:space:]]/}" ]; then
+              echo "## :warning: Needs hand-porting"
+              echo
+              echo "These files conflicted and were **kept at this fork's version**, so the upstream changes to them are *not* in this PR. Merging as-is is safe but incomplete — port them by hand before or after merging:"
+              echo
+              while IFS= read -r f; do
+                [ -z "$f" ] && continue
+                echo "- \`$f\`"
+              done <<< "$CONFLICTS"
+              echo
+            else
+              echo "Merged cleanly — no conflicts."
+              echo
+            fi
+
+            echo "## Upstream commits"
+            echo
+            git log --reverse --no-merges --pretty=format:'- [`%h`](https://github.com/reisxd/TizenTube/commit/%H) %s' "origin/main..upstream/${UPSTREAM_BRANCH}"
+            echo
+            echo
+            echo "_Opened automatically by \`.github/workflows/upstream-sync.yml\`._"
+          } > /tmp/pr-body.md
+
+          EXISTING=$(gh pr list --head "$SYNC_BRANCH" --state open --json number --jq '.[0].number // empty')
+          TITLE="Sync with upstream (${NEW_COMMITS} new commit(s))"
+
+          if [ -n "$EXISTING" ]; then
+            gh pr edit "$EXISTING" --title "$TITLE" --body-file /tmp/pr-body.md
+            echo "Updated PR #$EXISTING"
+          else
+            gh pr create --base main --head "$SYNC_BRANCH" --title "$TITLE" --body-file /tmp/pr-body.md
+          fi

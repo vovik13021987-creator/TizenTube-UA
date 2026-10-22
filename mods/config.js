@@ -1,0 +1,284 @@
+const CONFIG_KEY = 'ytaf-configuration';
+const defaultConfig = {
+  enableAdBlock: true,
+  enableSponsorBlock: true,
+  enableSponsorBlockToasts: true,
+  sponsorBlockManualSkips: ['intro', 'outro', 'filler'],
+  enableSponsorBlockSponsor: true,
+  enableSponsorBlockIntro: true,
+  enableSponsorBlockOutro: true,
+  enableSponsorBlockInteraction: true,
+  enableSponsorBlockSelfPromo: true,
+  enableSponsorBlockPreview: true,
+  enableSponsorBlockMusicOfftopic: true,
+  enableSponsorBlockFiller: false,
+  enableSponsorBlockHighlight: true,
+  videoSpeed: 1,
+  preferredVideoQuality: 'auto',
+  enableDeArrow: true,
+  enableDeArrowThumbnails: false,
+  enableReturnYoutubeDislike: false,
+  focusContainerColor: '#0f0f0f',
+  routeColor: '#0f0f0f',
+  enableFixedUI: (window.h5vcc && window.h5vcc.tizentube) ? false : true,
+  enableHqThumbnails: true,
+  enableChapters: true,
+  enableLongPress: true,
+  longPressMenuOrder: [],
+  longPressMenuHidden: [],
+  longPressShowPlaylists: false,
+  hiddenChannels: [],
+  longPressPlaylistIds: [],
+  longPressPlaylistOrder: [],
+  enableShorts: false,
+  dontCheckUpdateUntil: 0,
+  enableWhoIsWatchingMenu: false,
+  permanentlyEnableWhoIsWatchingMenu: false,
+  enableWhosWatchingMenuOnAppExit: false,
+  enableShowUserLanguage: true,
+  enableShowOtherLanguages: false,
+  enableCaptionStylePersistence: true,
+  enableStopForcedSubtitles: false,
+  captionStyleSettings: null,
+  captionsEnabled: null,
+  captionsOnCommand: null,
+  captionRawKeyBackups: {},
+  showWelcomeToast: false,
+  enablePreviousNextButtons: false,
+  enableSuperThanksButton: false,
+  enableAIAskButton: false,
+  enableSpeedControlsButton: true,
+  enablePatchingVideoPlayer: true,
+  enableMPButton: true,
+  enableSwapMPWithPIP: false,
+  // Buttons removed from the action row under the player.
+  hidePlayerJoinButton: false,
+  hidePlayerSubscribeButton: false,
+  hidePlayerThumbsButtons: false,
+  // Retired, both of them. One button draws both thumbs and the TVs ignore
+  // the renderer's hideDislikeButton flag, so neither half could be hidden
+  // on its own. Read only so a setting stored by an older build still hides
+  // the thumbs; hidePlayerThumbsButtons is the one that is offered.
+  hidePlayerLikeButton: false,
+  hidePlayerDislikeButton: false,
+  hidePlayerSaveButton: false,
+  hidePlayerCommentsButton: false,
+  hidePlayerAboutButton: false,
+  hidePlayerPreviousButton: false,
+  hidePlayerNextButton: false,
+  enablePreviews: false,
+  // Nudge a player that has stopped with data already buffered — see
+  // playbackUnwedge.js. On by default because the alternative, measured on
+  // device, is a freeze that only a manual app restart clears.
+  enablePlaybackUnwedge: true,
+  enableHideWatchedVideos: true,
+  hideWatchedVideosThreshold: 5,
+  // Exceptions to hiding watched videos — see hideWatchedExemptions.js. Each
+  // holds {id, title} entries; the title is only ever for the settings screen
+  // to have something readable to show.
+  hideWatchedExemptPlaylists: [],
+  hideWatchedExemptChannelPages: [],
+  hideWatchedExemptChannelNames: [],
+  // On at least one supported TV the response carries no watch state at all,
+  // so without this the filter can only hide what was watched on that TV.
+  hideWatchedVideosFromHistory: true,
+  hideWatchedVideosPages: [
+      'home',
+      'search',
+      'music',
+      'gaming',
+      'subscriptions',
+      'channel',
+      'playlist',
+      'more',
+      'watch'
+  ],
+  hiddenLibraryTabIds: ['festorefront', 'fecollection_podcasts', 'femy_videos', 'fehistory', 'femy_youtube', 'feplaylist_aggregation', 'femusic_last_played'],
+  hiddenSpecialPlaylistShelves: ['WL', 'LL'],
+  hiddenSpecialPlaylistTiles: ['WL', 'LL'],
+  enableHideEndScreenCards: false,
+  enableYouThereRenderer: false,
+  lastAnnouncementCheck: 0,
+  enableScreenDimming: false,
+  dimmingTimeout: 60,
+  dimmingOpacity: 0.5,
+  enablePaidPromotionOverlay: false,
+  speedSettingsIncrement: 0.25,
+  preferredVideoCodec: 'any',
+  launchToOnStartup: null,
+  reloadHomeOnStartup: true,
+  disabledSidebarContents: ['TROPHY', 'NEWS', 'YOUTUBE_MUSIC', 'BROADCAST', 'CLAPPERBOARD', 'LIVE', 'GAMING', 'TAB_MORE', 'SEARCH'],
+  sidebarContentsOrder: [],
+  disableChannelsOnSidebar: false,
+  // The account row above Home. Off by default: it is the only way to switch
+  // account from the sidebar, so nobody should lose it without asking.
+  hideAccountOnSidebar: false,
+  enableUpdater: true,
+  autoFrameRate: false,
+  autoFrameRatePauseVideoFor: 0,
+  enableSigninReminder: false,
+  sortSubscriptionsByAlphabet: false,
+  enableDebugConsole: false,
+  enableDebugLogging: false,
+  debugConsolePosition: 'top-left',
+  debugConsoleHeight: 1054,
+  logServerEnabled: false,
+  // Every category on by default, so upgrading changes nothing until the
+  // user narrows it down. 'basic' vs 'detailed' controls payload depth.
+  // sponsorblock is listed but deliberately NOT on by default: it was the
+  // loudest thing in the log by a wide margin, and nobody turned it on.
+  // sponsorblock, playbackDiag and subsShelf are listed as categories but
+  // deliberately absent here: all three were off by default before, and all
+  // three are loud or costly enough that nobody should get them without
+  // asking.
+  logCategories: ['nav', 'ads', 'shorts', 'watched', 'playlist', 'filters', 'shelves', 'thumbs', 'player', 'other'],
+  logVerbosity: 'detailed',
+  // syslog output, independent of the log server above.
+  syslogEnabled: false,
+  syslogHost: '',
+  syslogPort: 514,
+  syslogFacility: 16,
+  syslogAppName: 'TizenTube',
+  syslogHostname: '',
+  // Intentionally blank: this used to ship one developer's LAN address, so
+  // every install pointed its logs at a machine that is not the user's.
+  // Empty means "not set", which the settings menu already renders, and
+  // sendOne() treats as nothing to send.
+  logServerHost: '',
+  logServerPort: 3030,
+  enablePlaylistBatchCollect: false,
+  playlistBatchCollectMaxBatches: 50,
+  enableClock: false,
+  isClock12HourFormat: false,
+  clockShowSeconds: false,
+  clockHideWhenVideoPlaying: false,
+  disableEnlargingThumbnails: false,
+  enableShrinkingThumbnails: false,
+  enableKeywordHider: false,
+  // Empty means the built-in list in features/keywordHider.js, which is
+  // where it lives so that an upgrade reaches a config that already has an
+  // empty list written into it. Anything set here is taken as deliberate.
+  hiddenTitleKeywords: [],
+  hideMembersOnlyVideos: false,
+  hideViewCounts: false,
+  hideQualityBadges: false,
+  hidePaidVideos: false,
+  hideFreeWithAdsVideos: false,
+  hideDuplicateVideos: false,
+  hideAggregateShelf: false,
+  hideChannelShelves: false,
+  hideMusicShelf: false,
+  hideSurveys: false,
+  enableJumpToPercentage: false,
+  hideRelatedVideosPlayer: false,
+  spoofViewport: 'disabled',
+  enableReloadOnResume: false,
+  enableBixbyMicFix: false,
+  enableInstantSeek: false,
+  instantSeekDelayMs: 500,
+  enableStopAtPlaylistEnd: false,
+  enableRemainingTime: false,
+  enableFinishTime: false,
+};
+
+let localConfig;
+const populatedConfigWarnings = new Set();
+
+try {
+  const raw = window.localStorage[CONFIG_KEY];
+  if (raw === undefined || raw === null || raw === '' || raw === 'undefined') {
+    localConfig = { ...defaultConfig };
+  } else {
+    localConfig = JSON.parse(raw);
+  }
+  // Two settings became log categories (playbackDiag, subsShelf). Anyone who
+  // had them on keeps them on, and the old keys are dropped so the config does
+  // not carry a setting nothing reads. Only the STORED object is consulted:
+  // configRead would hand back the default and migrate a choice nobody made.
+  try {
+    const MOVED = { enablePlaybackDiagnostics: 'playbackDiag', diagSubscriptionsShelf: 'subsShelf' };
+    let moved = false;
+    for (const oldKey of Object.keys(MOVED)) {
+      if (!Object.prototype.hasOwnProperty.call(localConfig, oldKey)) continue;
+      const wasOn = localConfig[oldKey] === true;
+      delete localConfig[oldKey];
+      moved = true;
+      if (!wasOn) continue;
+      const cats = Array.isArray(localConfig.logCategories)
+        ? localConfig.logCategories.slice()
+        : defaultConfig.logCategories.slice();
+      if (cats.indexOf(MOVED[oldKey]) === -1) cats.push(MOVED[oldKey]);
+      localConfig.logCategories = cats;
+    }
+    if (moved) window.localStorage[CONFIG_KEY] = JSON.stringify(localConfig);
+  } catch (err) {
+    // A failed migration leaves both categories off, which is the default.
+  }
+} catch (err) {
+  console.warn('Config read failed:', err);
+  localConfig = { ...defaultConfig };
+}
+
+if (!localConfig || typeof localConfig !== 'object') {
+  localConfig = { ...defaultConfig };
+}
+
+// The visual debug console (and the logging that feeds it) must always
+// start off/hidden, regardless of what was last saved — confirmed
+// on-device: leaving it enabled across a restart (e.g. after being turned
+// on once to diagnose something) is suspected of contributing to the app
+// hanging on startup. Overridden in memory only (not written back to
+// storage), so re-enabling it from Settings during a session still works
+// exactly as before — it just won't carry over to the next app start.
+localConfig.enableDebugConsole = false;
+localConfig.enableDebugLogging = false;
+// Same reasoning applies to logServerEnabled: now that it alone triggers
+// console.* interception work (see visualConsole.js addLog), leaving it on
+// from a previous session means every console call pays that cost right
+// during YouTube's own page bootstrap — the highest-load moment — without
+// the user having deliberately turned it on for this session.
+localConfig.logServerEnabled = false;
+
+export function configRead(key) {
+  if (localConfig[key] === undefined) {
+    const hasDefault = Object.prototype.hasOwnProperty.call(defaultConfig, key);
+    localConfig[key] = hasDefault ? defaultConfig[key] : undefined;
+    if (hasDefault && !populatedConfigWarnings.has(key)) {
+      populatedConfigWarnings.add(key);
+      console.warn('Populating key', key, 'with default value', defaultConfig[key]);
+    }
+  }
+  return localConfig[key];
+}
+
+export function configWrite(key, value) {
+  console.info('Setting key', key, 'to', value);
+  if (value === undefined) {
+    delete localConfig[key];
+  } else {
+    localConfig[key] = value;
+  }
+  window.localStorage[CONFIG_KEY] = JSON.stringify(localConfig);
+  configChangeEmitter.dispatchEvent(new CustomEvent('configChange', { detail: { key, value } }));
+}
+
+export const configChangeEmitter = {
+  listeners: {},
+  addEventListener(type, callback) {
+    if (!this.listeners[type]) this.listeners[type] = [];
+    this.listeners[type].push(callback);
+  },
+  removeEventListener(type, callback) {
+    if (!this.listeners[type]) return;
+    this.listeners[type] = this.listeners[type].filter(cb => cb !== callback);
+  },
+  dispatchEvent(event) {
+    const type = event.type;
+    if (!this.listeners[type]) return;
+    this.listeners[type].forEach(cb => {
+      try {
+        cb.call(this, event)
+      } catch (_) {};
+    });
+  }
+};

@@ -1,0 +1,438 @@
+# -----------------------------------------------------------------------------
+# Build and release the TizenTube Standalone app (standalone/)
+#
+# WHAT THIS DOES
+# ---------------
+# Builds the userscript + regular DIAL service (needed by the standalone
+# service), then the standalone service itself, then packages and signs
+# standalone/ into a .wgt using Samsung's own Tizen Studio CLI, and publishes
+# it as a GitHub Release.
+#
+# Signing note: this used to sign via tizenjs (an unofficial community
+# packaging tool), which produced a .wgt that installed fine as an *update*
+# to an already-trusted app but was rejected with "invalid certificate
+# chain" on a brand-new app id's *first* install. Comparing against three
+# sibling projects (TizenBrew, TizenBrewInstaller, TizenYouTube) that all
+# install fine as fresh apps: the one thing they share and this build didn't
+# is that they're all packaged with Samsung's own official Tizen Studio CLI
+# (`tizen build-web` + `tizen package`), not tizenjs. TizenYouTube in
+# particular proved this isn't about certificate freshness — it uses the
+# exact same (long-expired) Samsung public sample distributor certificate
+# tizenjs was also falling back to, and still installs fine, because it's
+# packaged with the official tool. So this workflow now matches that same
+# working recipe: install Tizen Studio, configure a certificate profile
+# (author cert from secrets + Samsung's public sample distributor cert,
+# same as TizenYouTube/TizenBrew use), and package with `tizen package`
+# instead of tizenjs.
+#
+# This is entirely separate from build-publish-cleanup.yml (which builds and
+# npm-publishes the regular mod on push to main) — different trigger, no
+# shared state, so it doesn't affect that workflow.
+#
+# WHEN IT RUNS
+# ------------
+# - Automatically, right after "Build, publish and cleanup old npm versions"
+#   (build-publish-cleanup.yml) finishes successfully on main — i.e. once the
+#   userscript's new version has actually been bumped and published to npm.
+#   This keeps the standalone app's version in lockstep with the userscript:
+#   it reads the version build-publish-cleanup.yml just bumped in package.json
+#   and writes that same number into standalone/config.xml before packaging,
+#   rather than tracking its own separate version.
+# - On pushing a tag matching v*.*.* (e.g. v1.0.0)
+# - Manually via "Run workflow" (workflow_dispatch)
+#
+# PREREQUISITES (REQUIRED) — Tizen author certificate
+# -----------------------------------------------------
+# The build needs a Tizen author certificate to sign the .wgt.
+#
+# 1) Install Tizen Studio (or just the Certificate Manager) from
+#    https://developer.tizen.org/development/tizen-studio/download
+#
+# 2) Open Certificate Manager (Tizen Studio → Tools → Certificate Manager,
+#    or run `certificate-manager` directly from the Tizen Studio tools dir).
+#
+# 3) Author tab → "+" → "Create a new author certificate". Fill in a name,
+#    organization/email, and a password — remember this password. This
+#    produces an author.p12 file (Certificate Manager will tell you where
+#    it saved it).
+#
+# 4) Base64-encode the .p12 with NO line wrapping:
+#      Linux/macOS:  base64 -w0 author.p12
+#      Windows (PowerShell):
+#        [Convert]::ToBase64String([IO.File]::ReadAllBytes("author.p12"))
+#
+# 5) Add two repository secrets (GitHub repo → Settings → Secrets and
+#    variables → Actions → New repository secret):
+#      TIZEN_AUTHOR_KEY     = the base64 string from step 4
+#      TIZEN_AUTHOR_KEY_PW  = the certificate password from step 3
+#
+# (The distributor certificate needs no setup — it's Samsung's own public
+# sample certificate, bundled with Tizen Studio and installed automatically
+# by this workflow, same as TizenBrew/TizenYouTube use.)
+#
+# HOW TO TRIGGER A BUILD
+# -----------------------
+# git tag v1.0.0 && git push origin v1.0.0
+# (or use "Run workflow" in the Actions tab for an ad-hoc build)
+# -----------------------------------------------------------------------------
+
+name: Build TizenTube Standalone and Release
+
+on:
+  workflow_run:
+    workflows: ['Build, publish and cleanup old npm versions']
+    types: [completed]
+    # The branch the triggering run was on, which for a pull-request build is
+    # the feature branch. Without this, every pull request started a run here
+    # that the job-level `if` below immediately skipped: real runs, listed in
+    # the Actions tab, queued and accounted for, that could never do anything.
+    # Filtering at the trigger means they are never created.
+    branches: ['main']
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: 'Release version/tag name (e.g. v1.0.0)'
+        required: false
+
+env:
+  TIZEN_STUDIO_VER: 5.6
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Only proceed on a successful npm-publish run that was itself triggered by
+    # a push to main (build-publish-cleanup.yml's job is skipped entirely for
+    # pull_request runs, which can still report an overall "success" — checking
+    # .workflow_run.event too avoids firing off of those). The branches filter
+    # on the trigger now stops those runs from being created at all; this stays
+    # as the second check, since it also covers a publish run dispatched by
+    # hand off main. Tag pushes and manual dispatch always proceed.
+    if: >
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    permissions:
+      contents: write
+    steps:
+      # No explicit ref: default checkout behavior is already correct for every
+      # trigger — workflow_run checks out the default branch's current tip,
+      # push (tag) checks out the tag, workflow_dispatch checks out the branch
+      # it was run from. Pinning to github.event.workflow_run.head_sha (as an
+      # earlier version of this workflow did) is wrong: that's the commit that
+      # *triggered* build-publish-cleanup.yml, not the version-bump commit it
+      # produces partway through its own run — checking that out meant this
+      # workflow read package.json *before* the bump, one version behind.
+      - name: Clone repo with full history and tags
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Record the commit this build is actually based on
+        run: echo "RELEASE_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Determine release version (sync with userscript's package.json)
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.release_version }}" ]; then
+            RELEASE_VERSION="${{ github.event.inputs.release_version }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            RELEASE_VERSION="${GITHUB_REF#refs/tags/}"
+          elif [ -f package.json ]; then
+            PKG_VER=$(node -p "require('./package.json').version")
+            RELEASE_VERSION="${PKG_VER:+v$PKG_VER}"
+          fi
+
+          if [ -z "${RELEASE_VERSION:-}" ]; then
+            CFG_VER=$(sed -n 's/.*<widget[^>]*version="\([^"]*\)".*/\1/p' standalone/config.xml | head -n1)
+            RELEASE_VERSION="${CFG_VER:+v$CFG_VER}"
+            RELEASE_VERSION="${RELEASE_VERSION:-v0.0.0-${GITHUB_SHA:0:7}}"
+          fi
+          echo "RELEASE_VERSION=$RELEASE_VERSION" >> $GITHUB_ENV
+
+      - name: Sync standalone/config.xml version with the userscript's version
+        run: |
+          set -euo pipefail
+          NEW_VER="${RELEASE_VERSION#v}"
+          CUR_VER=$(sed -n 's/.*<widget[^>]*version="\([^"]*\)".*/\1/p' standalone/config.xml | head -n1)
+          if [ -n "$NEW_VER" ] && [ "$NEW_VER" != "$CUR_VER" ]; then
+            sed -i "0,/<widget /s/version=\"${CUR_VER}\"/version=\"${NEW_VER}\"/" standalone/config.xml
+            echo "standalone/config.xml version: ${CUR_VER} -> ${NEW_VER}"
+          else
+            echo "standalone/config.xml version already ${CUR_VER}, nothing to sync"
+          fi
+
+      - name: Determine app metadata for release notes
+        run: |
+          set -euo pipefail
+          APP_ID=$(sed -n 's/.*<tizen:application[^>]*id="\([^"]*\)".*/\1/p' standalone/config.xml | head -n1)
+          APP_NAME=$(echo "$APP_ID" | sed -n 's/^[^.]*\.\(.*\)$/\1/p')
+          echo "APP_ID=${APP_ID:-unknown}" >> $GITHUB_ENV
+          echo "APP_NAME=${APP_NAME:-unknown}" >> $GITHUB_ENV
+
+      # ----------------------------
+      # Build the regular mod + DIAL service — the standalone service wraps
+      # dist/service.js, so it must exist before the standalone service builds.
+      # ----------------------------
+      - name: Build mods (userScript.js)
+        working-directory: mods
+        run: |
+          set -euo pipefail
+          npm ci
+          npx rollup -c
+
+      - name: Build service (service.js)
+        working-directory: service
+        run: |
+          set -euo pipefail
+          npm ci
+          npx rollup -c
+
+      # ----------------------------
+      # Build the standalone service
+      # ----------------------------
+      - name: Build standalone service
+        working-directory: standalone/service
+        run: |
+          set -euo pipefail
+          npm install
+          npm install -g @vercel/ncc
+          npm run build
+          rm -rf node_modules transpiled
+
+      # ----------------------------
+      # Sign and package the standalone app with Tizen Studio
+      # ----------------------------
+      # Kept across runs, so one successful download is enough and an outage
+      # on Tizen's server cannot block a release on its own. Run 39221552892
+      # failed here with nothing but "curl: (22) 404", which read as a problem
+      # with this repository — it was not. Checked at the time: /releases/ on
+      # the same host answered 200 while everything under /sdk/ answered 404,
+      # including the Latest/ folder that search engines have indexed as
+      # holding files dated November 2025. There was no working URL to move to.
+      - name: Restore the Tizen Studio installer from cache
+        id: tizen_cache
+        uses: actions/cache@v4
+        with:
+          path: tizen-installer
+          key: tizen-installer-${{ env.TIZEN_STUDIO_VER }}-ubuntu-64
+
+      - name: Download Tizen Studio CLI
+        if: steps.tizen_cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          URL="https://download.tizen.org/sdk/Installer/tizen-studio_${TIZEN_STUDIO_VER}/web-cli_Tizen_Studio_${TIZEN_STUDIO_VER}_ubuntu-64.bin"
+          echo "Fetching ${URL}"
+
+          # Retried, because a download of this size from this host fails
+          # transiently often enough to be worth it. A 404 will not improve on
+          # retry, so that case breaks out immediately and is reported as what
+          # it is rather than as six identical failures.
+          for i in 1 2 3 4 5; do
+            CODE=$(curl -sSL -o tizen-installer -w '%{http_code}' "$URL" || echo 000)
+            if [ "$CODE" = "200" ] && [ -s tizen-installer ]; then
+              echo "attempt ${i}: downloaded $(stat -c%s tizen-installer) bytes"
+              chmod +x tizen-installer
+              exit 0
+            fi
+            echo "attempt ${i}: HTTP ${CODE}"
+            if [ "$CODE" = "404" ]; then break; fi
+            sleep 15
+          done
+
+          # Say which side is broken, so nobody looks here first again. The
+          # host is probed separately: an unreachable host and a missing file
+          # are different faults with different responses.
+          ROOT=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 https://download.tizen.org/ || echo 000)
+          echo "::error::Could not download the Tizen Studio CLI from ${URL} (last HTTP ${CODE}). download.tizen.org itself answered ${ROOT}, so if that is 200 and this is 404 then the SDK tree is broken or has moved on Tizen's side and there is nothing to fix in this repository — check https://download.tizen.org/sdk/Installer/ by hand and re-run when it returns. The installer is cached once a download succeeds, so this cannot block a release twice for the same reason."
+          exit 1
+
+      - name: Install Tizen Studio CLI
+        run: |
+          set -euo pipefail
+          chmod +x ./tizen-installer
+          ./tizen-installer --accept-license "${GITHUB_WORKSPACE}/tizen-studio"
+          # Deliberately not deleted any more: actions/cache saves this path at
+          # the end of the job, and removing it here meant there was never
+          # anything to save.
+          echo "${GITHUB_WORKSPACE}/tizen-studio/tools/ide/bin" >> $GITHUB_PATH
+
+      - name: Configure certificate profile
+        env:
+          AUTHOR_P12_B64: ${{ secrets.TIZEN_AUTHOR_KEY }}
+          AUTHOR_P12_PASSWORD: ${{ secrets.TIZEN_AUTHOR_KEY_PW }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${GITHUB_WORKSPACE}/tizen-data/keystore/author"
+          mkdir -p "${GITHUB_WORKSPACE}/tizen-data/profile"
+          echo "$AUTHOR_P12_B64" | base64 -d > "${GITHUB_WORKSPACE}/tizen-data/keystore/author/author.p12"
+
+          echo "Author cert encryption before conversion:"
+          openssl pkcs12 -info -in "${GITHUB_WORKSPACE}/tizen-data/keystore/author/author.p12" -passin env:AUTHOR_P12_PASSWORD -noout 2>&1 | grep -i "pbe\|cipher\|mac" || true
+
+          # Tizen Studio's bundled Java signing tool is old and can fail to read a
+          # PKCS#12 file encrypted with the modern AES-256 cipher OpenSSL 3.x (the
+          # default everywhere since ~2021) uses by default — throwing a generic,
+          # misleading "Invalid password" even when the password is correct. Both
+          # node-forge (what tizenjs used) and modern OpenSSL read AES-256 p12s
+          # fine, so this wouldn't have surfaced until switching to Tizen Studio's
+          # own tooling. Re-encrypt with the older, broadly-compatible cipher
+          # in-place — same password, same cert/key contents, just an older wrapper.
+          openssl pkcs12 -legacy -in "${GITHUB_WORKSPACE}/tizen-data/keystore/author/author.p12" -out /tmp/author-intermediate.pem -nodes -passin env:AUTHOR_P12_PASSWORD
+          openssl pkcs12 -export -legacy -in /tmp/author-intermediate.pem -passout env:AUTHOR_P12_PASSWORD -out "${GITHUB_WORKSPACE}/tizen-data/keystore/author/author.p12" -certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg sha1
+          rm -f /tmp/author-intermediate.pem
+
+          echo "Author cert encryption after conversion:"
+          openssl pkcs12 -info -in "${GITHUB_WORKSPACE}/tizen-data/keystore/author/author.p12" -passin env:AUTHOR_P12_PASSWORD -noout 2>&1 | grep -i "pbe\|cipher\|mac" || true
+
+          cp .github/assets/profiles.xml "${GITHUB_WORKSPACE}/tizen-data/profile/profiles.xml"
+          python3 -c "from pathlib import Path; import os; from xml.sax.saxutils import escape; p=Path(os.environ['GITHUB_WORKSPACE'])/'tizen-data/profile/profiles.xml'; t=p.read_text(); t=t.replace('\$GITHUB_WORKSPACE', os.environ['GITHUB_WORKSPACE']).replace('\$KEY_PW', escape(os.environ['AUTHOR_P12_PASSWORD'], {'\"':'&quot;'})); p.write_text(t)"
+
+          tizen cli-config "profiles.path=${GITHUB_WORKSPACE}/tizen-data/profile/profiles.xml"
+
+      - name: Build web app
+        working-directory: standalone
+        run: >
+          tizen build-web
+          -e "service/index.js"
+          -e "service/injector.js"
+          -e "service/bootstrap.js"
+          -e "service/build-service.js"
+          -e "service/package.json"
+          -e "service/package-lock.json"
+          -e "service/node_modules"
+          -e "release"
+
+      - name: Package WGT
+        working-directory: standalone
+        run: |
+          set -euo pipefail
+          tizen package -t wgt -s TizenTubeStandalone -- ./
+          mkdir -p release
+          cp *.wgt release/TizenTube.wgt
+
+      - name: Show Tizen CLI log on failure
+        if: failure()
+        run: |
+          LOG_PATH="${GITHUB_WORKSPACE}/tizen-studio-data/cli/logs/cli.log"
+          if [ -f "$LOG_PATH" ]; then
+            echo "--- tizen cli.log ---"
+            cat "$LOG_PATH"
+          else
+            echo "No cli.log found at $LOG_PATH"
+          fi
+
+      - name: Upload TizenTube Standalone artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: TizenTube-Standalone-${{ env.RELEASE_SHA }}.wgt
+          path: standalone/release/TizenTube.wgt
+
+      # Changelog is built from the PRs merged since the previous published
+      # release; the build/TBI_METADATA header stays first so the TizenBrew
+      # Installer still finds it.
+      - name: Build release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash .github/scripts/build-release-notes.sh             "${{ env.RELEASE_SHA }}"             "${{ env.RELEASE_VERSION }}"             "${{ env.APP_ID }}"             "${{ env.APP_NAME }}"             "$RUNNER_TEMP/release-notes.md"
+
+      # Was softprops/action-gh-release@v1, replaced after a 403 that could
+      # neither be diagnosed nor recovered from. Three faults, all the step's
+      # rather than GitHub's:
+      #
+      #   it printed "undefined" as the error body, so a rate limit, a
+      #   permission problem and a validation error all looked the same
+      #
+      #   it retried three times inside 1.2 seconds (09:41:34.5, :35.3, :35.7)
+      #   and called that too many retries. An undocumented 403 on a token
+      #   that worked thirteen hours earlier is a secondary rate limit more
+      #   often than anything else, and those want tens of seconds
+      #
+      #   it was not idempotent, so a re-run after a partial success had no
+      #   defined behaviour
+      #
+      # The .wgt is uploaded as an artifact by the step above, before any of
+      # this runs, so a failure here never loses the build.
+      - name: Release TizenTube Standalone
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ env.RELEASE_VERSION }}
+          TARGET: ${{ env.RELEASE_SHA }}
+          NOTES: ${{ runner.temp }}/release-notes.md
+        run: |
+          set -uo pipefail
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          AUTH="Authorization: Bearer ${GH_TOKEN}"
+          JSON="Accept: application/vnd.github+json"
+          ID_OF='import json,sys; d=json.load(sys.stdin); print((d.get("id") if isinstance(d,dict) else "") or "")'
+
+          # Reuse the release if it is already there. That is what makes a
+          # re-run safe: an earlier attempt may have created it before failing.
+          ID=$(curl -s -H "$AUTH" -H "$JSON" "$API/releases/tags/${TAG}" | python3 -c "$ID_OF" 2>/dev/null || echo '')
+
+          if [ -n "$ID" ]; then
+            echo "release ${TAG} already exists (id ${ID}); its assets will be replaced"
+          else
+            python3 -c 'import json,io,os,sys; p=sys.argv[3]; b=io.open(p,encoding="utf-8").read() if os.path.exists(p) else ""; print(json.dumps({"tag_name":sys.argv[1],"target_commitish":sys.argv[2],"name":sys.argv[1],"body":b}))' "$TAG" "$TARGET" "$NOTES" > /tmp/release.json
+            for delay in 0 15 45 90; do
+              if [ "$delay" != "0" ]; then echo "waiting ${delay}s before retrying"; sleep "$delay"; fi
+              CODE=$(curl -s -o /tmp/release-out.json -w '%{http_code}' -X POST -H "$AUTH" -H "$JSON" "$API/releases" --data @/tmp/release.json)
+              echo "create release ${TAG} -> HTTP ${CODE}"
+              if [ "$CODE" = "201" ]; then
+                ID=$(python3 -c 'import json;print(json.load(open("/tmp/release-out.json"))["id"])')
+                break
+              fi
+              # 422 means the tag or release turned up meanwhile; take it.
+              if [ "$CODE" = "422" ]; then
+                ID=$(curl -s -H "$AUTH" -H "$JSON" "$API/releases/tags/${TAG}" | python3 -c "$ID_OF" 2>/dev/null || echo '')
+                if [ -n "$ID" ]; then echo "it already existed; reusing id ${ID}"; break; fi
+              fi
+              # Unlike the action this replaces, say what GitHub actually said.
+              head -c 500 /tmp/release-out.json; echo
+            done
+          fi
+
+          if [ -z "$ID" ]; then
+            echo "::error::Could not create or find release ${TAG}. GitHub's own message is printed above. A 403 here, with a token that worked on earlier releases, is usually a secondary rate limit — re-running this job later is the first thing to try. The .wgt is attached to this run as an artifact either way, so nothing is lost."
+            exit 1
+          fi
+
+          UPLOAD="https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${ID}/assets"
+          ASSET_ID='import json,sys; print(next((str(a["id"]) for a in json.load(sys.stdin) if a["name"]==sys.argv[1]), ""))'
+          FAILED=0
+          for file in standalone/release/*; do
+            if [ ! -f "$file" ]; then continue; fi
+            NAME=$(basename "$file")
+
+            # Replace rather than fail: an asset of this name may already be
+            # attached from an earlier attempt at this same release.
+            OLD=$(curl -s -H "$AUTH" -H "$JSON" "$API/releases/${ID}/assets?per_page=100" | python3 -c "$ASSET_ID" "$NAME" 2>/dev/null || echo '')
+            if [ -n "$OLD" ]; then
+              echo "removing the existing ${NAME} (asset ${OLD})"
+              curl -s -o /dev/null -X DELETE -H "$AUTH" -H "$JSON" "$API/releases/assets/${OLD}"
+            fi
+
+            CODE=000
+            for delay in 0 15 45; do
+              if [ "$delay" != "0" ]; then echo "waiting ${delay}s before retrying ${NAME}"; sleep "$delay"; fi
+              CODE=$(curl -s -o /tmp/asset-out.json -w '%{http_code}' -X POST -H "$AUTH" -H "Content-Type: application/octet-stream" --data-binary @"$file" "${UPLOAD}?name=${NAME}")
+              echo "upload ${NAME} ($(stat -c%s "$file") bytes) -> HTTP ${CODE}"
+              if [ "$CODE" = "201" ]; then break; fi
+              head -c 300 /tmp/asset-out.json; echo
+            done
+            if [ "$CODE" != "201" ]; then FAILED=1; fi
+          done
+
+          if [ "$FAILED" != "0" ]; then
+            echo "::error::Release ${TAG} exists but at least one asset did not upload. The .wgt is attached to this run as an artifact, and re-running this job replaces the assets rather than duplicating them."
+            exit 1
+          fi
+          echo "release ${TAG} is complete"

@@ -1,0 +1,7 @@
+packets/
+node_modules/
+*.wgt
+dist/
+transpiled/
+.sign
+package-lock.json

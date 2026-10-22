@@ -1,0 +1,874 @@
+import { configRead } from '../config.js';
+import { lockupVideoId, lockupWatchPercent } from './lockupViewModel.js';
+import { sendSyslog } from './syslog.js';
+import { noteProgressChanged } from './watchProgressStore.js';
+import { isCategoryEnabled, applyVerbosity } from './logCategories.js';
+
+// ── Logging ───────────────────────────────────────────────────────────────────
+
+export function appendFileOnlyLog(label, payload) {
+  // Previously gated on enableDebugLogging alone, so entries never got
+  // created (and thus never relayed) unless that was also turned on —
+  // confirmed by user report: logServerEnabled alone wasn't enough to get
+  // these onto the PC log receiver, needing enableDebugLogging too, even
+  // though these never show in the on-screen visual console either way.
+  // logServerEnabled alone is now sufficient for the PC relay path.
+  // Categories only ever come into play while something is actually consuming
+  // logs. The sinks are the visual console (which reads __ttFileOnlyLogs for
+  // its downloadable file), background logging, the log server, and syslog —
+  // with none of them on, nothing is recorded at all and the category list is
+  // irrelevant.
+  const anySinkEnabled = configRead('enableDebugConsole')
+    || configRead('enableDebugLogging')
+    || configRead('logServerEnabled')
+    || configRead('syslogEnabled');
+  if (!anySinkEnabled) return;
+  // Filtering happens before the entry is built, so a disabled category costs
+  // nothing — no JSON.stringify, no queue entry, and no work for
+  // logServer.js's once-a-second in-page serialize.
+  if (!isCategoryEnabled(label)) return;
+  if (!Array.isArray(window.__ttFileOnlyLogs)) window.__ttFileOnlyLogs = [];
+  let msg = '';
+  try { msg = JSON.stringify(applyVerbosity(payload, label)); } catch { msg = String(payload); }
+  // syslog taps the same choke point rather than logServer.js's array hook, so
+  // the two outputs stay fully independent — either can be on without the
+  // other, and a dead syslog target cannot stop the log server relaying. Sent
+  // after the verbosity pass so both outputs carry the same text.
+  try { sendSyslog({ ts: new Date().toISOString(), level: 'INFO', context: 'TizenTube', label, message: `${label} ${msg}` }); } catch (_) { }
+  // No longer truncated here — logServer.js's sendRemotePayload now splits
+  // long messages into multiple sent parts instead of the previous cutoff
+  // silently discarding everything past 500 chars. This array also feeds
+  // the downloadable log file (downloadTizenTubeLogs()), which has no
+  // reason to lose content either.
+  window.__ttFileOnlyLogs.push(`[${new Date().toISOString()}] [TT_ADBLOCK_FILE] ${label} ${msg}`);
+  if (window.__ttFileOnlyLogs.length > 5000) window.__ttFileOnlyLogs.shift();
+}
+
+const _shownOnScreen = new Set();
+
+/**
+ * A diagnostic the user is being asked to read, so it has to be readable.
+ *
+ * appendFileOnlyLog is exactly what its name says: it reaches the downloadable
+ * file, the log server and syslog, and never the on-screen console. That is
+ * right for the high-volume per-tile lines, and wrong for the handful of
+ * one-shot "send me this line" diagnostics — reported after being asked to
+ * look in the visual console for a line that could never appear there.
+ *
+ * So this writes to the file log as before and also goes through console.warn,
+ * which visualConsole.js intercepts. Once per distinct message, because the
+ * on-screen console is small and a repeated line would push the rest off it.
+ */
+export function appendVisibleLog(label, payload) {
+  try {
+    let msg = '';
+    try { msg = JSON.stringify(payload); } catch { msg = String(payload); }
+    const line = `[TizenTube] ${label} ${msg}`;
+    // The screen holds one copy of a line and only so many of them.
+    const blocked = _shownOnScreen.has(line) || _shownOnScreen.size >= 40;
+
+    // Once the console is captured, console.warn already reaches the log file
+    // and the log server, so writing a file copy here as well is what put
+    // every one of these in the log twice. Where the line is not going to the
+    // screen, the file copy is the only one there is.
+    let captured = false;
+    try { captured = window.__ttConsoleCaptured === true; } catch (_) { }
+    if (!captured || blocked) appendFileOnlyLog(label, payload);
+
+    if (blocked) return;
+    _shownOnScreen.add(line);
+    console.warn(line);
+  } catch (_) { }
+}
+
+// ── Page detection ────────────────────────────────────────────────────────────
+
+function browseIdToPage(id) {
+  const b = String(id || '').toLowerCase();
+  if (b.includes('fesubscription')) return 'subscriptions';
+  if (b.startsWith('uc')) return 'channel';
+  if (b === 'fehistory') return 'history';
+  if (b === 'felibrary') return 'library';
+  if (b === 'feplaylist_aggregation') return 'playlists';
+  if (b === 'femy_youtube' || b === 'vlwl' || b === 'vlll' || b.startsWith('vlpl')) return 'playlist';
+  return null;
+}
+
+export const detectPageFromBrowseId = browseIdToPage;
+
+export function detectCurrentPage() {
+  try {
+    const hash = location.hash ? location.hash.substring(1) : '';
+    const cParam = (
+      hash.match(/(?:^|[?&])c=([^&]+)/i)?.[1] ||
+      location.search.match(/(?:^|[?&])c=([^&]+)/i)?.[1] || ''
+    ).toLowerCase();
+    if (hash.startsWith('/watch')) return 'watch';
+    if (hash.startsWith('/channel/') || hash.startsWith('/c/') || hash.startsWith('/@')) return 'channel';
+    const fromC = browseIdToPage(cParam);
+    if (fromC) return fromC;
+    return hash === '/' ? 'home'
+      : hash.startsWith('/search') ? 'search'
+      : (hash.split('?')[1]?.split('&')[0]?.split('=')[1] || 'home').replace('FE', '').replace('topics_', '');
+  } catch {
+    return 'home';
+  }
+}
+
+export function detectPageFromResponse(response) {
+  try {
+    if (response?.contents?.singleColumnWatchNextResults) return 'watch';
+    for (const entry of response?.responseContext?.serviceTrackingParams || []) {
+      for (const param of entry?.params || []) {
+        if (param?.key === 'browse_id') {
+          const page = browseIdToPage(param.value);
+          if (page) return page;
+        }
+      }
+    }
+    const targetId = String(response?.contents?.tvBrowseRenderer?.targetId || '').toLowerCase();
+    if (targetId.startsWith('browse-feed')) {
+      const page = browseIdToPage(targetId.replace('browse-feed', ''));
+      if (page) return page;
+    }
+    return browseIdToPage(response?.currentVideoEndpoint?.watchEndpoint?.browseEndpoint?.browseId);
+  } catch {
+    return null;
+  }
+}
+
+export function detectAndStorePage(pageName, source = 'unknown') {
+  if (pageName) {
+    const prev = window.__ttLastDetectedPage;
+    window.__ttLastDetectedPage = pageName;
+    if (prev !== pageName) appendFileOnlyLog('page.store', { source, previous: prev, next: pageName });
+  }
+  return pageName;
+}
+
+if (!window.__ttHideWatchedLocationTrackingInit) {
+  window.__ttHideWatchedLocationTrackingInit = true;
+  const sync = () => {
+    try {
+      const p = detectCurrentPage();
+      if (p && p !== 'home' && p !== 'search') detectAndStorePage(p, 'nav');
+      const keys = [..._carryover.keys()];
+      if (keys.length) {
+        appendFileOnlyLog('consolidate.carryover.navClear', { cleared: keys, page: p });
+        _carryover.clear();
+      }
+    } catch (_) { }
+  };
+  try { sync(); window.addEventListener('hashchange', sync); window.addEventListener('popstate', sync); } catch (_) {}
+}
+
+// ── Watch progress extraction ─────────────────────────────────────────────────
+
+// Shapes of tiles already reported as carrying no progress, so a shelf of
+// thirty identical ones reports once. Capped, because the signature includes
+// key names from the response and a long session should not grow it without
+// bound.
+const _noProgressShapes = new Set();
+const MAX_NO_PROGRESS_SHAPES = 25;
+
+/**
+ * What a tile with no readable progress actually carries.
+ *
+ * Reported: watched videos are still shown on the subscriptions page. The
+ * summary says the filter ran and did its job — 34 tiles removed across 20
+ * calls — and that 33 more came back with nothing to judge them by. Those are
+ * the ones still on screen, and the question is whether YouTube said nothing
+ * or said it somewhere this does not look.
+ *
+ * Only the key names are logged, never the values: enough to name a field
+ * worth reading, and nothing that describes what was watched.
+ */
+function noteNoProgressShape(item, pageName) {
+  try {
+    const tile = item && item.tileRenderer;
+    if (!tile) return;
+    const overlays = (tile.header && tile.header.tileHeaderRenderer && tile.header.tileHeaderRenderer.thumbnailOverlays)
+      || tile.thumbnailOverlays || [];
+    const overlayKeys = [];
+    for (let i = 0; i < overlays.length; i++) {
+      const name = Object.keys(overlays[i] || {})[0];
+      if (name && overlayKeys.indexOf(name) === -1) overlayKeys.push(name);
+    }
+    const badgeStyles = [];
+    const badges = tile.badges || [];
+    for (let i = 0; i < badges.length; i++) {
+      const style = badges[i] && badges[i].metadataBadgeRenderer && badges[i].metadataBadgeRenderer.style;
+      if (style && badgeStyles.indexOf(style) === -1) badgeStyles.push(String(style));
+    }
+    const signature = pageName + '|' + overlayKeys.join(',') + '|' + badgeStyles.join(',') + '|' + Object.keys(tile).sort().join(',');
+    if (_noProgressShapes.has(signature) || _noProgressShapes.size >= MAX_NO_PROGRESS_SHAPES) return;
+    _noProgressShapes.add(signature);
+    appendFileOnlyLog('hideVideo.noProgressShape', {
+      pageName,
+      overlays: overlayKeys,
+      badges: badgeStyles,
+      tileKeys: Object.keys(tile).sort(),
+      // Named explicitly because their absence is the whole question: these
+      // are the two fields read directly off the tile.
+      hasWatchProgressPercentage: Object.prototype.hasOwnProperty.call(item, 'watchProgressPercentage'),
+      hasPercentDurationWatched: Object.prototype.hasOwnProperty.call(item, 'percentDurationWatched'),
+    });
+  } catch (_) { }
+}
+
+// What the response itself says about progress, or null if it says nothing.
+function responseWatchPercent(item) {
+  const overlays = item?.tileRenderer?.header?.tileHeaderRenderer?.thumbnailOverlays
+    || item?.tileRenderer?.thumbnailOverlays || [];
+  const resume = overlays.find(o => o.thumbnailOverlayResumePlaybackRenderer)?.thumbnailOverlayResumePlaybackRenderer;
+  if (resume) {
+    const pct = resume.percentDurationWatched;
+    return (pct !== null && pct !== undefined) ? Number(pct) : 100;
+  }
+  if (overlays.some(o => o.thumbnailOverlayPlaybackStatusRenderer || o.thumbnailOverlayPlayedRenderer)) return 100;
+  const badges = item?.tileRenderer?.badges || [];
+  if (badges.some(b => {
+    const s = String(b?.metadataBadgeRenderer?.style || '') + String(b?.metadataBadgeRenderer?.label || '');
+    return s.toLowerCase().includes('watched');
+  })) return 100;
+  // lockupViewModel (search results) puts progress on a bottom overlay bar
+  // rather than a thumbnailOverlayResumePlaybackRenderer (upstream ca60382).
+  const lockupPct = lockupWatchPercent(item);
+  if (lockupPct !== null) return lockupPct;
+  const raw = item?.watchProgressPercentage ?? item?.percentDurationWatched ?? null;
+  if (raw !== null) return Number(raw);
+  return null;
+}
+
+// The higher of what the response says and what is known locally.
+//
+// The response used to win outright, with the cache only a fallback for when it
+// said nothing, on the reasoning that a rewatch from the start should show its
+// new low progress. But the response is exactly what lags: minutes after a video
+// is watched, YouTube can still send its tile with the old overlay, or none at
+// all, and the filter then shows it again — the reported playlist behaviour.
+// For a filter that hides WATCHED videos, "watched here and not yet reflected by
+// YouTube" has to count, and a rewatch does not make a video unwatched.
+export function getWatchPercent(item) {
+  try {
+    const fromResponse = responseWatchPercent(item);
+    const videoId = item?.tileRenderer?.contentId
+      || item?.tileRenderer?.onSelectCommand?.watchEndpoint?.videoId
+      || lockupVideoId(item);
+    // History outranks everything: being in it means the account watched the
+    // video to the point YouTube recorded it, which is a stronger statement
+    // than any percentage read off a tile. Checked before the cache so a
+    // video watched elsewhere needs nothing to have happened on this TV.
+    if (watchedByHistory(videoId)) return 100;
+    const stored = videoId ? window._ttVideoProgressCache?.[videoId] : undefined;
+    const cached = stored === undefined || stored === null ? null : Number(stored);
+    const known = cached !== null && isFinite(cached) ? cached : null;
+    if (fromResponse === null || !isFinite(fromResponse)) return known;
+    if (known === null) return fromResponse;
+    return Math.max(fromResponse, known);
+  } catch {
+    return null;
+  }
+}
+
+// ── Exemptions ────────────────────────────────────────────────────────────────
+
+// Playlists and channels that keep their watched videos, supplied by
+// hideWatchedExemptions.js rather than imported from it. This file holds
+// appendFileOnlyLog, which some thirty-five modules import, so importing
+// anything that imports this back would make a cycle rollup warns about on
+// every build. Nothing is exempt until that module registers itself.
+let _exemption = null;
+
+// Whether the account's own history says a video has been watched, supplied by
+// watchHistory.js the same way and for the same reason.
+//
+// This exists because on the 6.5 TV the response carries no watch state at
+// all: a full day's capture holds not one
+// thumbnailOverlayResumePlaybackRenderer, and a subscriptions tile's only
+// overlay is its duration. So a video finished on a PC is indistinguishable
+// from one never opened, and the history is the only place left to ask.
+let _watchedLookup = null;
+
+export function setWatchedLookup(check) {
+    _watchedLookup = typeof check === 'function' ? check : null;
+}
+
+function watchedByHistory(videoId) {
+    try {
+        return !!(videoId && _watchedLookup && _watchedLookup(videoId));
+    } catch (_) {
+        return false;
+    }
+}
+
+export function setHideWatchedExemption(check) {
+    _exemption = check && typeof check.page === 'function' && typeof check.item === 'function'
+        ? check
+        : null;
+}
+
+function pageExempt(pageName) {
+    try { return _exemption ? _exemption.page(pageName) : null; } catch (_) { return null; }
+}
+
+function itemExempt(item, pageName) {
+    try { return _exemption ? _exemption.item(item, pageName) : null; } catch (_) { return null; }
+}
+
+// ── hideVideo ─────────────────────────────────────────────────────────────────
+
+// Reported repeatedly: watched videos are not being hidden. Three of the ways
+// that can happen used to leave no trace at all — the feature switched off, the
+// page not in the configured list, and an exception on a single tile, which the
+// per-item catch turns into "keep it" for every tile after it as well. The
+// counters below exist so one line can distinguish those from the case where
+// hiding ran correctly and simply found nothing watched.
+let _loggedDisabled = false;
+let _lastPageNotEnabled = '';
+
+export function hideVideo(items, pageHint = null) {
+  if (!Array.isArray(items)) return items;
+  if (!configRead('enableHideWatchedVideos')) {
+    // Once per session. It is not a fault, but it is the first thing to rule
+    // out and the only evidence of it would otherwise be an absence.
+    if (!_loggedDisabled) {
+      _loggedDisabled = true;
+      appendFileOnlyLog('hideVideo.disabled', { reason: 'enableHideWatchedVideos is off' });
+    }
+    return items;
+  }
+  const pages = configRead('hideWatchedVideosPages');
+  const threshold = configRead('hideWatchedVideosThreshold');
+  const hashPage = detectCurrentPage();
+  const pageName = (pageHint && pageHint !== 'home' && pageHint !== 'search') ? pageHint
+    : (hashPage !== 'home' && hashPage !== 'search') ? hashPage
+    : (window.__ttLastDetectedPage || hashPage);
+  appendFileOnlyLog('hideVideo.context', { pageHint, hashPage, pageName, lastDetected: window.__ttLastDetectedPage || null });
+  // Read by playbackProgress.js to tell whether returning to a page produced
+  // a fresh response or a re-shown copy of the old one.
+  window.__ttPageRenderedAt = { page: pageName, at: Date.now() };
+  if (!pages.includes(pageName)) {
+    // Deduped on the page name rather than logged per call: a single response
+    // can reach here once per tile array, and all of those say the same thing.
+    if (_lastPageNotEnabled !== pageName) {
+      _lastPageNotEnabled = pageName;
+      appendFileOnlyLog('hideVideo.pageNotEnabled', { pageName, pages, items: items.length });
+    }
+    return items;
+  }
+  _lastPageNotEnabled = '';
+  // This whole playlist or channel was exempted. Checked before the per-tile
+  // work rather than inside it: nothing on the page is to be hidden, so there
+  // is no reason to read progress off every tile to decide that.
+  const exemptPage = pageExempt(pageName);
+  if (exemptPage) {
+    appendFileOnlyLog('hideVideo.exempt.page', { pageName, because: exemptPage, items: items.length });
+    return items;
+  }
+  // Tallied rather than logged per tile, so the summary below costs one line
+  // per call however many items there are.
+  const why = { noVideoId: 0, exempt: 0, keepOne: 0, noProgress: 0, underThreshold: 0, removed: 0, removedByHistory: 0, threw: 0 };
+  let firstError = null;
+  const kept = items.filter(item => {
+    try {
+      // Search results are lockupViewModel rather than tileRenderer; without
+      // this they were never eligible for hiding at all (upstream ca60382 has
+      // the same code path but left it unreachable behind a tileRenderer-only
+      // early return).
+      const videoId = item?.tileRenderer?.contentId || lockupVideoId(item);
+      if (!videoId) { why.noVideoId++; return true; }
+      if (item.__ttKeepOneForContinuation) {
+        const currentSeq = Number(window.__ttParseSeq || 0);
+        const itemSeq = Number(item.__ttKeepOneForContinuationParseSeq || 0);
+        if (pageName === 'playlist' && itemSeq > 0 && itemSeq === currentSeq) {
+          why.keepOne++;
+          appendFileOnlyLog('hideVideo.keep_one', { pageName, videoId });
+          return true;
+        }
+        delete item.__ttKeepOneForContinuation;
+        delete item.__ttKeepOneForContinuationLabel;
+        delete item.__ttKeepOneForContinuationParseSeq;
+      }
+      // A channel exempted everywhere keeps its watched videos on this page
+      // too. Checked here rather than above the continuation bookkeeping, so
+      // an exempt tile still clears the markers it would otherwise leave on
+      // the item for the next parse to find.
+      const exemptItem = itemExempt(item, pageName);
+      if (exemptItem) { why.exempt++; return true; }
+      const pct = getWatchPercent(item);
+      if (pct === null) {
+        why.noProgress++;
+        appendFileOnlyLog('hideVideo.noProgress', { pageName, videoId });
+        // Once per distinct tile shape, which is what turns "nothing to judge
+        // it by" into either "YouTube said nothing" or "we are not reading
+        // the field it said it in".
+        noteNoProgressShape(item, pageName);
+        return true;
+      }
+      const keep = pct <= threshold;
+      if (keep) why.underThreshold++;
+      else {
+        why.removed++;
+        // Named, because "removed" from history and "removed" from a
+        // percentage are different claims and only one of them needs the
+        // response to have said anything.
+        const fromHistory = watchedByHistory(videoId);
+        if (fromHistory) why.removedByHistory++;
+        appendFileOnlyLog('hideVideo.removed', { pageName, pct, videoId, fromHistory });
+      }
+      return keep;
+    } catch (err) {
+      // This swallowed every failure here in silence, and it fails open: one
+      // throw keeps one video, and a throw on every tile keeps all of them,
+      // which looks exactly like the feature doing nothing.
+      why.threw++;
+      if (!firstError) firstError = String(err?.message || err);
+      return true;
+    }
+  });
+  // The one line worth reading when hiding appears not to work. Every item is
+  // accounted for by exactly one counter, so the reason is in the numbers:
+  // noProgress means YouTube sent no watch overlay and nothing local was
+  // known, underThreshold means the videos are watched less than the threshold
+  // allows, exempt means a playlist or channel was deliberately spared, and
+  // threw means this code is broken.
+  appendFileOnlyLog('hideVideo.summary', {
+    pageName, items: items.length, kept: kept.length, removed: items.length - kept.length,
+    threshold, reasons: why, msg: firstError,
+  });
+  return kept;
+}
+
+// ── processTileArraysDeep ─────────────────────────────────────────────────────
+
+function isVideoItem(item) {
+  return !!(item?.tileRenderer || item?.videoRenderer || item?.gridVideoRenderer
+    || item?.compactVideoRenderer || item?.lockupViewModel);
+}
+
+export function processTileArraysDeep(node, pageHint = null, path = 'root', depth = 0, extraFilter = null) {
+  if (!node || depth > 10) return;
+  try {
+    if (Array.isArray(node)) {
+      if (node.some(isVideoItem)) {
+        const before = node.length;
+        let filtered = hideVideo(node, pageHint);
+        if (extraFilter) filtered = extraFilter(filtered, pageHint);
+        if (before !== filtered.length) appendFileOnlyLog('deep.tiles.filtered', { path, pageHint, before, after: filtered.length, removed: before - filtered.length });
+        node.splice(0, node.length, ...filtered);
+        return;
+      }
+      for (let i = 0; i < node.length; i++) processTileArraysDeep(node[i], pageHint, `${path}[${i}]`, depth + 1, extraFilter);
+      return;
+    }
+    if (typeof node !== 'object') return;
+    for (const key of Object.keys(node)) processTileArraysDeep(node[key], pageHint, `${path}.${key}`, depth + 1, extraFilter);
+  } catch (_) { }
+}
+
+// ── consolidateShelves ────────────────────────────────────────────────────────
+
+const _seen = new WeakSet();
+
+const _carryover = new Map();
+
+export function clearCarryover() {
+  const keys = [..._carryover.keys()];
+  if (keys.length) appendFileOnlyLog('consolidate.carryover.cleared', { cleared: keys });
+  _carryover.clear();
+}
+
+// Only subscriptions and watch benefit from consolidation.
+// Channel page is intentionally excluded — it breaks the channel page layout.
+const CONSOLIDATE_PAGES = new Set(['subscriptions', 'watch']);
+
+export function consolidateShelves(contents, path = 'unknown', pageName = null, hasContinuation = false, itemFilter = null) {
+  appendFileOnlyLog('consolidate.check', { path, contentsLength: contents?.length, pageName, hasContinuation });
+  if (!configRead('enableHideWatchedVideos')) return;
+  if (pageName && !CONSOLIDATE_PAGES.has(pageName)) return;
+  if (!Array.isArray(contents)) return;
+  if (_seen.has(contents)) { appendFileOnlyLog('consolidate.skip.weakset', { path }); return; }
+  _seen.add(contents);
+
+  try {
+    const shelves = contents.filter(c => c.shelfRenderer);
+    if (!shelves.length) return;
+
+    // Collect only real video tiles: require watchEndpoint.videoId OR exactly 11-char contentId.
+    // Channel cards use browseEndpoint only and have a 24-char browseId as contentId — excluded.
+    const allItems = shelves.flatMap(s => s.shelfRenderer.content.horizontalListRenderer.items || []);
+    let freshItems = allItems.filter(item => {
+      const watchVideoId = item?.tileRenderer?.onSelectCommand?.watchEndpoint?.videoId;
+      if (watchVideoId) return true;
+      const contentId = item?.tileRenderer?.contentId;
+      return contentId && String(contentId).length === 11;
+    });
+
+    if (itemFilter) freshItems = itemFilter(freshItems, pageName);
+
+    // Apply carryover from previous batch for this pageName.
+    // Only discard if current path is a tab.* path and sourcePath differs (initial tab load
+    // after a tab switch). Tab-switch clears are handled by clearCarryover() in adblock.js
+    // which is called whenever tvSurfaceContentContinuation fires (channel tab initial load).
+    const isTabPath = path.startsWith('tab.');
+    let carried = [];
+    if (pageName && _carryover.has(pageName)) {
+      const stored = _carryover.get(pageName);
+      const isStale = isTabPath && stored.sourcePath !== path;
+      if (isStale) {
+        _carryover.delete(pageName);
+        appendFileOnlyLog('consolidate.carryover.tabSwitch', { path, pageName, discarded: stored.items.length, oldPath: stored.sourcePath });
+      } else {
+        carried = [...stored.items];
+        _carryover.delete(pageName);
+        appendFileOnlyLog('consolidate.carryover.apply', { path, pageName, carried: carried.length });
+      }
+    }
+
+    if (!freshItems.length && !carried.length) return;
+
+    // Deduplicate — seed seenIds with carried IDs so fresh items can't duplicate them.
+    const seenIds = new Set();
+    for (const item of carried) {
+      const id = item?.tileRenderer?.onSelectCommand?.watchEndpoint?.videoId || item?.tileRenderer?.contentId || null;
+      if (id) seenIds.add(id);
+    }
+    const dedupedFresh = freshItems.filter(item => {
+      const id = item?.tileRenderer?.onSelectCommand?.watchEndpoint?.videoId || item?.tileRenderer?.contentId || null;
+      if (!id) return true;
+      if (seenIds.has(id)) { appendFileOnlyLog('consolidate.dedup', { path, videoId: id }); return false; }
+      seenIds.add(id);
+      return true;
+    });
+    const dedupedItems = [...carried, ...dedupedFresh];
+    if (!dedupedItems.length) return;
+
+    // perRow: max across all shelves' recorded original row size and current item counts.
+    const perRow = Math.max(
+      ...shelves.map(s => s.shelfRenderer.content.horizontalListRenderer._originalRowSize || 0),
+      ...shelves.map(s => s.shelfRenderer.content.horizontalListRenderer.items?.length || 0),
+      3
+    );
+
+    const insertAt = contents.findIndex(c => c.shelfRenderer);
+    for (let i = contents.length - 1; i >= 0; i--) if (contents[i].shelfRenderer) contents.splice(i, 1);
+
+    // Pick the template from the first shelf that has a non-empty title or no suspicious header.
+    // Avoids using a Shorts shelf (which survived processShelves) as template, which would
+    // copy the "Shorts" heading into all consolidated rows.
+    const template = shelves.find(s => {
+      const firstItem = s.shelfRenderer.content.horizontalListRenderer.items?.[0];
+      return !firstItem?.tileRenderer?.onSelectCommand?.reelWatchEndpoint && !firstItem?.reelItemRenderer;
+    }) || shelves[0];
+
+    const newShelves = [];
+
+    for (let i = 0; i + perRow <= dedupedItems.length; i += perRow) {
+      const rowItems = dedupedItems.slice(i, i + perRow);
+      const hlr = {
+        ...template.shelfRenderer.content.horizontalListRenderer,
+        items: rowItems,
+        visibleItemCount: rowItems.length,
+        collapsedItemCount: rowItems.length,
+        totalItemCount: rowItems.length,
+      };
+      if (typeof hlr.selectedIndex === 'number') hlr.selectedIndex = 0;
+      if (typeof hlr.focusIndex === 'number')    hlr.focusIndex = 0;
+      if (typeof hlr.currentIndex === 'number')  hlr.currentIndex = 0;
+      newShelves.push({ shelfRenderer: { ...template.shelfRenderer, content: { horizontalListRenderer: hlr } } });
+    }
+
+    // Partial remainder handling:
+    // hasContinuation=true  → store as carryover; next batch prepends them before packing rows.
+    // hasContinuation=false → last batch; render partial row as-is.
+    const remainder = dedupedItems.length % perRow;
+    if (remainder > 0) {
+      const lastBatch = dedupedItems.slice(dedupedItems.length - remainder);
+      if (hasContinuation && pageName) {
+        _carryover.set(pageName, { items: lastBatch, sourcePath: path });
+        appendFileOnlyLog('consolidate.carryover.store', { path, pageName, stored: lastBatch.length, perRow });
+      } else {
+        const hlr = {
+          ...template.shelfRenderer.content.horizontalListRenderer,
+          items: lastBatch,
+          visibleItemCount: lastBatch.length,
+          collapsedItemCount: lastBatch.length,
+          totalItemCount: lastBatch.length,
+        };
+        if (typeof hlr.selectedIndex === 'number') hlr.selectedIndex = 0;
+        if (typeof hlr.focusIndex === 'number')    hlr.focusIndex = 0;
+        if (typeof hlr.currentIndex === 'number')  hlr.currentIndex = 0;
+        newShelves.push({ shelfRenderer: { ...template.shelfRenderer, content: { horizontalListRenderer: hlr } } });
+      }
+    }
+
+    contents.splice(insertAt, 0, ...newShelves);
+    appendFileOnlyLog('consolidate.done', {
+      path, pageName, perRow,
+      totalItems: allItems.length, freshItems: freshItems.length,
+      carried: carried.length,
+      deduped: (freshItems.length + carried.length) - dedupedItems.length,
+      newRows: newShelves.length,
+      carryoverStored: (hasContinuation && remainder > 0) ? remainder : 0,
+    });
+  } catch (err) {
+    appendFileOnlyLog('consolidate.error', { path, msg: String(err?.message || err) });
+  }
+}
+
+// ── Entity mutation progress cache ────────────────────────────────────────────
+
+// Cap on ids named in one progress_learned line, so a large batch of mutations
+// cannot flood the queue logServer.js drains in-page every second.
+const MAX_LEARNED_LOGGED = 12;
+
+export function updateProgressCache(r) {
+  if (!r?.frameworkUpdates?.entityBatchUpdate?.mutations) return;
+  if (!window._ttVideoProgressCache) window._ttVideoProgressCache = {};
+  // Recorded so a capture can show whether progress was actually learned. This
+  // was silent before, which is why "watched videos reappear until the app is
+  // restarted" produced no evidence either way.
+  const learned = [];
+  for (const mutation of r.frameworkUpdates.entityBatchUpdate.mutations) {
+    try {
+      const key = String(mutation?.entityKey || '');
+      const payload = mutation?.payload || {};
+      const pct = payload?.videoAttributionModel?.watchProgressPercentage
+        ?? payload?.videoData?.watchProgressPercentage
+        ?? payload?.macroMarkersListEntity?.watchProgressPercentage
+        ?? null;
+      if (pct !== null) {
+        const videoId = key.includes('|') ? key.split('|')[0] : key;
+        const before = window._ttVideoProgressCache[videoId];
+        // Never lowered. YouTube's number lags what was just watched here
+        // (see playbackProgress.js), and overwriting would undo it.
+        if (!(Number(before) >= Number(pct))) window._ttVideoProgressCache[videoId] = Number(pct);
+        // Logged only when the stored value actually moved, so a capture does
+        // not claim a lower number was learned when the higher one was kept.
+        const after = window._ttVideoProgressCache[videoId];
+        if (before !== after && learned.length < MAX_LEARNED_LOGGED) learned.push({ videoId, pct: Number(pct) });
+        // Persisted so the fallback survives a power cycle — see
+        // watchProgressStore.js. The write itself is debounced, so this is
+        // cheap to call per mutation.
+        noteProgressChanged(videoId);
+        const explicitId = payload?.videoAttributionModel?.externalVideoId
+          || payload?.videoData?.videoId || null;
+        if (explicitId) {
+          const prior = window._ttVideoProgressCache[String(explicitId)];
+          if (!(Number(prior) >= Number(pct))) window._ttVideoProgressCache[String(explicitId)] = Number(pct);
+          noteProgressChanged(String(explicitId));
+        }
+      }
+    } catch (_) { }
+  }
+  if (learned.length) {
+    appendFileOnlyLog('hideVideo.progress_learned', { entries: learned, tracked: Object.keys(window._ttVideoProgressCache).length });
+  }
+}
+
+export function startEmptyTileObserver() {}
+
+// ── Normalizers (shared by adblock + any future renderer filters) ─────────────
+
+export function normalizeHorizontalListRenderer(hlr, _context = '') {
+  if (!hlr || !Array.isArray(hlr.items)) return;
+  const count = hlr.items.length;
+  if (typeof hlr.visibleItemCount === 'number') hlr.visibleItemCount = count;
+  if (typeof hlr.collapsedItemCount === 'number') hlr.collapsedItemCount = count;
+  if (typeof hlr.totalItemCount === 'number') hlr.totalItemCount = count;
+  const clamp = (v) => (typeof v !== 'number') ? v : (count <= 0 ? 0 : Math.max(0, Math.min(count - 1, v)));
+  if (typeof hlr.selectedIndex === 'number') hlr.selectedIndex = clamp(hlr.selectedIndex);
+  if (typeof hlr.focusIndex === 'number') hlr.focusIndex = clamp(hlr.focusIndex);
+  if (typeof hlr.currentIndex === 'number') hlr.currentIndex = clamp(hlr.currentIndex);
+}
+
+export function normalizeGridRenderer(gridRenderer, _context = '') {
+  if (!gridRenderer || !Array.isArray(gridRenderer.items)) return;
+  const count = gridRenderer.items.length;
+  if (typeof gridRenderer.visibleItemCount === 'number') gridRenderer.visibleItemCount = count;
+  if (typeof gridRenderer.totalItemCount === 'number') gridRenderer.totalItemCount = count;
+  if (typeof gridRenderer.currentIndex === 'number') {
+    gridRenderer.currentIndex = count <= 0 ? 0 : Math.max(0, Math.min(count - 1, gridRenderer.currentIndex));
+  }
+}
+
+// ── Video ID extraction helper ────────────────────────────────────────────────
+
+export function getItemVideoId(item) {
+  // richItemRenderer is a wrapper, not a renderer — the real tile sits inside
+  // it. Unwrapped first so every shape below is reached either way.
+  const inner = item?.richItemRenderer?.content || item;
+  return String(
+    inner?.tileRenderer?.contentId ||
+    inner?.tileRenderer?.onSelectCommand?.watchEndpoint?.videoId ||
+    inner?.tileRenderer?.onSelectCommand?.watchEndpoint?.playlistId ||
+    inner?.tileRenderer?.onSelectCommand?.reelWatchEndpoint?.videoId ||
+    // lockupViewModel gained support across the codebase in the ca60382 port,
+    // but this extractor was left tileRenderer-only. Anything lockup-shaped
+    // therefore came back as '' — invisible to duplicate detection and to the
+    // playlist unique-id floor, with no log line to say so.
+    lockupVideoId(inner) ||
+    inner?.videoRenderer?.videoId ||
+    inner?.gridVideoRenderer?.videoId ||
+    inner?.compactVideoRenderer?.videoId ||
+    ''
+  );
+}
+
+/** Human-readable title for an item, for diagnostics only. */
+export function getItemTitle(item) {
+  const inner = item?.richItemRenderer?.content || item;
+  return inner?.tileRenderer?.metadata?.tileMetadataRenderer?.title?.simpleText
+    || inner?.lockupViewModel?.metadata?.lockupMetadataViewModel?.title?.content
+    || inner?.videoRenderer?.title?.runs?.[0]?.text
+    || inner?.videoRenderer?.title?.simpleText
+    || inner?.gridVideoRenderer?.title?.runs?.[0]?.text
+    || inner?.compactVideoRenderer?.title?.runs?.[0]?.text
+    || null;
+}
+
+// ── Deep watch-progress extraction ───────────────────────────────────────────
+
+export function collectWatchProgressEntries(node, out = [], depth = 0, seen = new WeakSet()) {
+  if (!node || depth > 10) return out;
+  if (Array.isArray(node)) { for (const child of node) collectWatchProgressEntries(child, out, depth + 1, seen); return out; }
+  if (typeof node !== 'object') return out;
+  if (seen.has(node)) return out;
+  seen.add(node);
+  const id = node.videoId || node.externalVideoId || node.contentId || null;
+  const pctRaw = node.watchProgressPercentage ?? node.percentDurationWatched ?? node.watchedPercent ?? null;
+  const pct = Number(pctRaw);
+  if (id && Number.isFinite(pct)) out.push({ id: String(id), percent: pct, source: 'deep_scan' });
+  for (const key of Object.keys(node)) collectWatchProgressEntries(node[key], out, depth + 1, seen);
+  return out;
+}
+
+// ── Shared playlist button helpers ────────────────────────────────────────────
+// playlistContinue.js injects a custom button into the playlist header
+// using these shared utilities.
+
+export function getPlaylistButtons(r) {
+  const twoCol = r?.contents?.tvBrowseRenderer?.content?.tvSurfaceContentRenderer?.content?.twoColumnRenderer;
+  if (!twoCol) return null;
+  const leftCol = twoCol?.leftColumn;
+  const headerA = leftCol?.playlistHeaderRenderer;
+  const headerB = leftCol?.entityMetadataRenderer;
+  let headerC = null;
+  const slrContents = leftCol?.sectionListRenderer?.contents;
+  if (Array.isArray(slrContents)) {
+    for (const item of slrContents) {
+      if (item?.playlistHeaderRenderer) { headerC = item.playlistHeaderRenderer; break; }
+      if (item?.entityMetadataRenderer) { headerC = item.entityMetadataRenderer; break; }
+    }
+  }
+  const header = headerA || headerB || headerC;
+  if (!header) return null;
+  return header.buttons || header.actionButtons || (Array.isArray(header.actions) ? header.actions : null);
+}
+
+export function injectPlaylistButton(buttons, actionName, label, iconType) {
+  if (!Array.isArray(buttons) || !buttons.length) return false;
+  if (buttons.some(b =>
+    b?.buttonRenderer?.command?.customAction?.action === actionName ||
+    b?.buttonRenderer?.serviceEndpoint?.customAction?.action === actionName
+  )) return false;
+  const existing =
+    buttons.find(b => b?.buttonRenderer?.text?.runs || b?.buttonRenderer?.text?.simpleText) ||
+    buttons.find(b => b?.buttonRenderer);
+  if (!existing) return false;
+  const btn = { buttonRenderer: JSON.parse(JSON.stringify(existing.buttonRenderer)) };
+  const br = btn.buttonRenderer;
+  if (br.text?.runs) {
+    br.text.runs[0].text = label;
+  } else if (br.text?.simpleText) {
+    br.text.simpleText = label;
+  } else {
+    br.text = { runs: [{ text: label }] };
+  }
+  if (br.icon) br.icon.iconType = iconType;
+  else br.icon = { iconType };
+  const cmd = { clickTrackingParams: null, customAction: { action: actionName } };
+  br.command = cmd;
+  br.serviceEndpoint = cmd;
+  if (br.navigationEndpoint) delete br.navigationEndpoint;
+  if (br.onLongPressCommand) delete br.onLongPressCommand;
+  if (br.accessibilityData) br.accessibilityData = { accessibilityData: { label } };
+  buttons.push(btn);
+  return true;
+}
+
+// ── CSS-based helper tile hider ───────────────────────────────────────────────
+// Hides helper tiles by injecting a <style> rule keyed to the video ID.
+// More robust than DOM removal because the virtual list re-renders from its
+// internal data; CSS persists across re-renders.
+
+const _HELPER_STYLE_ID = 'tt-playlist-helper-hide';
+
+// WARNING — these selectors are known NOT to match playlist helper tiles.
+// An on-device structure dump (playlist.helper.tile_structure) showed a real
+// helper tile carries only: hybridnavfocusable, disablehybridnavdescendants-
+// ifblurred, role, id (ytlr-tile-renderer:d5), aria-labelledby, tabindex,
+// class, style. There is no data-video-id / video-id / data-content-id /
+// content-id anywhere on it. The video id appears only inside a descendant
+// <ytlr-thumbnail-details>'s inline background-image URL, which is why the
+// outerHTML substring scan in adblock.js finds these tiles and every
+// attribute-selector lookup reports matched:0.
+//
+// Kept because other renderers on other pages do carry these attributes, but
+// do not add helper-hiding logic here expecting it to work — hiding a helper
+// has to go through adblock.js's substring scan, which has a node reference.
+function _helperSelectors(ids) {
+  return ids.flatMap(id => [
+    `[data-video-id="${id}"]`,
+    `[video-id="${id}"]`,
+    `[data-content-id="${id}"]`,
+    `[content-id="${id}"]`,
+  ]).join(', ');
+}
+
+// Active and retired helpers are hidden DIFFERENTLY, on purpose:
+//
+//   active  — the one helper currently anchoring the next continuation.
+//             visibility:hidden, so it keeps its layout box and stays a valid
+//             scroll/continuation anchor for the virtual list. Removing it
+//             from layout risks emptying the list, which makes YouTube TV
+//             reload the whole page (see removeRetiredHelpersFromTiles).
+//
+//   retired — helpers from earlier batches, already superseded and awaiting
+//             DOM removal. These anchor nothing. They previously shared the
+//             active rule, so they also kept their layout boxes — and since
+//             their DOM removal frequently doesn't land (on-device logs show
+//             repeated dom.cleanup attempts with matched:0/removed:0, plus
+//             deferredNoContent when the helper is the only tile present),
+//             they linger as invisible-but-space-occupying tiles. That is
+//             exactly the reported symptom: several blank slots before the
+//             real content, with the visible tile pushed down a row.
+//             display:none removes the layout box entirely, so no gap — and
+//             if the virtual list re-renders one during scroll it stays
+//             collapsed instead of reappearing as another blank slot.
+export function updateHelperHideStyle(activeIds, retiredIds) {
+  if (typeof document === 'undefined') return;
+  let style = document.getElementById(_HELPER_STYLE_ID);
+  if (!style) {
+    style = document.createElement('style');
+    style.id = _HELPER_STYLE_ID;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  const active  = activeIds  ? Array.from(activeIds)  : [];
+  // An id that is somehow in both sets is treated as active — the anchor role
+  // is the one with the page-reload consequence if we get it wrong.
+  const retired = (retiredIds ? Array.from(retiredIds) : []).filter(id => !active.includes(id));
+
+  if (!active.length && !retired.length) { style.textContent = ''; return; }
+
+  const rules = [];
+  if (active.length) {
+    rules.push(`${_helperSelectors(active)} { visibility: hidden !important; pointer-events: none !important; }`);
+  }
+  if (retired.length) {
+    rules.push(`${_helperSelectors(retired)} { display: none !important; pointer-events: none !important; }`);
+  }
+  style.textContent = rules.join('\n');
+}

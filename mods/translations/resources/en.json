@@ -1,0 +1,596 @@
+{
+    "__contributors": [
+        "reisxd"
+    ],
+    "settings": {
+        "options": {
+            "socialMedia": {
+                "title": "Social Media Links",
+                "qrCodeScanMessage": "You can visit the {{name}} page by scanning the QR code below."
+            },
+            "adBlock": "Ad Block",
+            "sponsorblock": {
+                "title": "SponsorBlock Settings",
+                "options": {
+                    "enableSB": "Enable SponsorBlock",
+                    "manualSkip": "Manual SponsorBlock Segment Skip",
+                    "segments": "Segments",
+                    "categories": {
+                        "sponsor": "Skip Sponsor Segments",
+                        "intro": "Skip Intro Segments",
+                        "outro": "Skip Outro Segments",
+                        "interaction": "Skip Interaction Reminder Segments",
+                        "selfpromo": "Skip Self-Promotion Segments",
+                        "preview": "Skip Preview/Recap Segments",
+                        "filler": "Skip Tangents/Jokes Segments",
+                        "music_offtopic": "Skip Off-Topic Music Segments",
+                        "highlights": "Enable Highlights"
+                    },
+                    "showSBToasts": "Show SponsorBlock Toasts"
+                }
+            },
+            "dearrow": {
+                "title": "DeArrow Settings",
+                "options": {
+                    "enableDA": "Enable DeArrow",
+                    "enableDAThumbnails": "Enable DeArrow Thumbnails"
+                }
+            },
+            "misc": {
+                "title": "Miscellaneous Settings",
+                "options": {
+                    "endScreenCards": "Hide End Screen Cards",
+                    "youThereRenderer": "Enable 'Are you still watching?' Renderer",
+                    "paidPromoOverlay": "Enable 'Includes paid promotion' Overlay",
+                    "whosWatching": {
+                        "title": "Who's Watching Menu",
+                        "options": {
+                            "enableWW": "Enable Who's Watching Menu",
+                            "permaEnableWW": "Permanently Enable Who's Watching Menu",
+                            "enableWWOnExit": "Enable Who's Watching Menu on App Exit"
+                        }
+                    },
+                    "fixUI": "Fix UI",
+                    "hqThumbnails": "Enable High Quality Thumbnails",
+                    "longPress": "Enable Long Press Actions",
+                    "jumpToPercentage": "Number Keys Jump to Percentage",
+                    "reloadOnResume": "Reload After TV Wakes",
+                    "shorts": "Enable Shorts",
+                    "videoPreviews": "Enable Video Previews",
+                    "ttWelcomeMsg": "Show TT Welcome Message",
+                    "guestSignInReminder": "Show Guest Sign In Reminder",
+                    "reloadHomeOnStartup": "Reload Home on Startup",
+                    "logging": {
+                        "title": "Logging",
+                        "verbosity": {
+                            "title": "Log Detail Level",
+                            "subtitle": "Basic logs what happened; detailed adds the full payload",
+                            "basic": "Basic",
+                            "detailed": "Detailed"
+                        },
+                        "categories": {
+                            "title": "Log Categories",
+                            "subtitle": "Choose which features write log entries",
+                            "nav": "Navigation and pages",
+                            "ads": "Ad blocking",
+                            "shorts": "Shorts filtering",
+                            "watched": "Hide watched videos",
+                            "playlist": "Playlist batch loading",
+                            "filters": "Members-only, surveys, library",
+                            "shelves": "Shelves and tiles",
+                            "thumbs": "Thumbnails and DeArrow",
+                            "player": "Player, playback recovery, captions",
+                            "other": "Everything else",
+                            "sponsorblock": "SponsorBlock",
+                            "playbackDiag": "Playback stalls and timing (costly)",
+                            "subsShelf": "Subscription shelf layout"
+                        }
+                    },
+                    "debugConsole": {
+                        "title": "Debug Console",
+                        "enable": "Enable Debug Console",
+                        "enableLogging": "Enable Background Debug Logging",
+                        "position": "Console Position",
+                        "positions": {
+                            "topLeft": "Top Left",
+                            "topRight": "Top Right",
+                            "bottomLeft": "Bottom Left",
+                            "bottomRight": "Bottom Right",
+                            "center": "Center"
+                        },
+                        "height": "Console Height"
+                    },
+                    "logServer": {
+                        "title": "Remote Log Server",
+                        "enable": "Enable Remote Logging",
+                        "receiverSubtitle": "Receiver: {{host}}:{{port}}",
+                        "receiverNotSet": "not set",
+                        "test": "Test Log Server Connection",
+                        "testSubtitle": "Send a test entry via TizenBrew relay to verify the connection",
+                        "testQueued": "Test entry queued — check TizenBrew log viewer",
+                        "testDisabled": "Enable Remote Logging first",
+                        "testFailed": "Log ping failed",
+                        "disabled": "Remote Logging disabled",
+                        "host": "Receiver PC IP",
+                        "port": "Receiver Port",
+                        "testSentButOff": "Test log sent, but Remote Logging is still off."
+                    },
+                    "syslog": {
+                        "title": "Syslog Server",
+                        "enable": "Enable Syslog Output",
+                        "receiverSubtitle": "Sending to {{host}}:{{port}}",
+                        "receiverNotSet": "not set",
+                        "test": "Test Syslog Connection",
+                        "testSubtitle": "Send a single frame to the syslog server",
+                        "testDisabled": "Syslog output is turned off.",
+                        "testNoHost": "No syslog host is set.",
+                        "testQueued": "Syslog test frame sent.",
+                        "testFailed": "Could not send the syslog frame.",
+                        "host": "Syslog Server IP",
+                        "port": "Syslog Port",
+                        "testSentButOff": "Syslog frame sent, but Syslog Output is still off."
+                    },
+                    "longPressMenu": {
+                        "visible": {
+                            "title": "Long Press Menu Entries",
+                            "subtitle": "Choose which entries the long press menu shows"
+                        },
+                        "sort": {
+                            "title": "Sort Long Press Menu",
+                            "subtitle": "Choose the order the entries appear in",
+                            "empty": "No entries are shown — turn some on first"
+                        },
+                        "moveUp": {
+                            "title": "Move Up",
+                            "subtitle": "Move this entry one place up"
+                        },
+                        "moveDown": {
+                            "title": "Move Down",
+                            "subtitle": "Move this entry one place down"
+                        },
+                        "showPlaylists": "Show Your Playlists in the Long Press Menu",
+                        "playlists": {
+                            "title": "Playlists in the Long Press Menu",
+                            "subtitle": "Pick which of your playlists appear there",
+                            "loading": "Loading your playlists…",
+                            "retry": "Try again"
+                        },
+                        "playlistOrder": {
+                            "title": "Sort Playlists in the Long Press Menu",
+                            "subtitle": "Choose the order your playlists appear in"
+                        },
+                        "title": "Long Press Menu"
+                    },
+                    "bixbyMicFix": "Stop Bixby Interrupting Voice Search"
+                }
+            },
+            "subtitles": {
+                "title": "Subtitle Settings",
+                "options": {
+                    "showLocalSubtitle": "Show Local Subtitle",
+                    "showHiddenSubtitles": "Show Hidden Subtitles",
+                    "persistCaptionStyle": "Remember Caption Style",
+                    "stopForcedSubtitles": "Stop Videos Turning Subtitles On"
+                }
+            },
+            "videoPlayer": {
+                "title": "Video Player Settings",
+                "subtitle": "Customize video player features",
+                "options": {
+                    "patching": {
+                        "title": "Patch Video Player UI",
+                        "options": {
+                            "enableVPUIPatching": "Enable Video Player UI Patching",
+                            "previousNextBtns": "Enable Previous and Next Buttons",
+                            "showSuperThxBtn": "Show Super Thanks Button",
+                            "showAIAskBtn": "Show Ask Button",
+                            "showSpeedCtrlBtn": "Show Speed Controls Button",
+                            "addMPBtn": "Show Mini Player Button",
+                            "swapMPWithPIP": "Swap Mini Player Button with PiP Button"
+                        }
+                    },
+                    "hidePlayerButtons": {
+                        "title": "Hide Player Buttons",
+                        "subtitle": "Buttons to remove from the row under the player",
+                        "options": {
+                            "join": "Hide Join/Membership Button",
+                            "subscribe": "Hide Subscribe Button",
+                            "thumbs": "Hide Thumbs Up/Down Buttons",
+                            "save": "Hide Save Button",
+                            "comments": "Hide Comments Button",
+                            "about": "Hide Description Button",
+                            "previous": "Hide Previous Button",
+                            "next": "Hide Next Button"
+                        }
+                    },
+                    "preferredVideoQuality": {
+                        "title": "Preferred Video Quality",
+                        "subtitle": "Choose the preferred or next best video quality applied when playback starts"
+                    },
+                    "spoofViewport": {
+                        "title": "Spoof Viewport Resolution",
+                        "subtitle": "Report a different screen resolution to YouTube. App restart required. Useful if the TV reports a lower resolution to the browser than it can actually decode.",
+                        "disabled": "Disabled"
+                    },
+                    "speedSettings": {
+                        "title": "Speed Settings Increments",
+                        "subtitle": "Set the speed increments for video playback speed adjustments"
+                    },
+                    "remainingTime": "Show Time Remaining",
+                    "hideRelatedVideosPlayer": "Hide Related Videos in Player",
+                    "preferredVideoCodec": {
+                        "title": "Preferred Video Codec",
+                        "subtitle": "Choose the preferred video codec for playback"
+                    },
+                    "afr": "Auto Frame Rate",
+                    "afrPauseDuration": {
+                        "title": "Auto Frame Rate Pause Duration",
+                        "subtitle": "Set the duration (in seconds) to pause video playback when adjusting frame rate"
+                    },
+                    "codecAny": "Any",
+                    "qualityAuto": "Auto",
+                    "finishTime": "Show When the Video Will End",
+                    "stopAtPlaylistEnd": "Stop at the End of a Playlist",
+                    "instantSeek": {
+                        "title": "Instant Seek",
+                        "subtitle": "Keep the seek bar moving instead of waiting for OK",
+                        "options": {
+                            "enable": "Enable Instant Seek",
+                            "delay": {
+                                "title": "Commit Delay",
+                                "subtitle": "How long to wait after you stop pressing",
+                                "value": "{{ms}} ms"
+                            }
+                        }
+                    }
+                }
+            },
+            "time": {
+                "second": "{{count}} second",
+                "seconds": "{{count}} seconds",
+                "minute": "{{count}} minute",
+                "minutes": "{{count}} minutes"
+            },
+            "uiSettings": {
+                "title": "User Interface Settings",
+                "subtitle": "Customize the UI to your liking",
+                "options": {
+                    "hideWatchedVideos": {
+                        "title": "Hide Watched Videos",
+                        "options": {
+                            "enableHideWatchedVideos": "Enable Hide Watched Videos",
+                            "hideWatchedVideosFromHistory": "Also hide videos from your watch history",
+                            "watchedVideosThreshold": {
+                                "title": "Watched Videos Threshold",
+                                "subtitle": "Set the percentage threshold for hiding watched videos"
+                            },
+                            "setPagesToHideWatchedVideos": "Set Pages to Hide Watched Videos",
+                            "pages": {
+                                "search": "Search Results",
+                                "home": "Home",
+                                "music": "Music",
+                                "gaming": "Gaming",
+                                "subscriptions": "Subscriptions",
+                                "channel": "Channel Pages",
+                                "library": "Library",
+                                "playlist": "Library → Individual Playlists (WL, LL, etc)",
+                                "history": "Library → History",
+                                "more": "More",
+                                "watch": "Watch"
+                            },
+                            "exemptions": {
+                                "title": "Exceptions",
+                                "subtitle": "Playlists and channels that keep their watched videos",
+                                "empty": "No exceptions — set one from a video’s long press menu",
+                                "kinds": {
+                                    "playlist": "Playlist — select to hide watched videos here again",
+                                    "channelPage": "Channel page — select to hide watched videos here again",
+                                    "channelName": "Channel, away from its own page — select to hide watched videos again"
+                                }
+                            }
+                        }
+                    },
+                    "screenDimming": {
+                        "title": "Screen Dimming",
+                        "options": {
+                            "enableScreenDimming": "Enable Screen Dimming",
+                            "dimmingTimeout": {
+                                "title": "Dimming Timeout",
+                                "subtitle": "Set the inactivity timeout (in seconds) before the screen dims"
+                            },
+                            "dimmingOpacity": {
+                                "title": "Dimming Opacity",
+                                "subtitle": "Set the opacity level for screen dimming"
+                            }
+                        }
+                    },
+                    "disableSidebarContents": {
+                        "title": "Disable Sidebar Contents",
+                        "subtitle": "Select sidebar contents to disable"
+                    },
+                    "launchToOnStartup": {
+                        "title": "Launch To on Startup",
+                        "subtitle": "Choose the default page TizenTube opens to on startup"
+                    },
+                    "sortSubscriptionsByAlphabet": "Sort Subscriptions Alphabetically",
+                    "disableChannelsOnSidebar": "Disable Channels on Sidebar",
+                    "hideAccountOnSidebar": "Hide the account row above Home",
+                    "playlistBatchLoad": {
+                        "title": "Playlist Batch Load",
+                        "loadAllAtOnce": "Load All Batches at Once",
+                        "maxBatches": "Max Batches to Fetch",
+                        "maxBatchesSubtitle": "Maximum number of batches to fetch at once (each batch = 15 videos). Higher = more complete but slower initial load.",
+                        "maxBatchesOption": "{{n}} batches (~{{videos}} videos)"
+                    },
+                    "hiddenPlaylists": {
+                        "title": "Hide Special Playlists",
+                        "shelves": {
+                            "title": "Library Shelves"
+                        },
+                        "tiles": {
+                            "title": "Playlists"
+                        },
+                        "options": {
+                            "likedVideos": "Liked Videos",
+                            "watchLater": "Watch Later"
+                        }
+                    },
+                    "libraryTabs": {
+                        "title": "Library Tabs Buttons to Hide",
+                        "options": {
+                            "music": "Music",
+                            "moviesShows": "Movies & Shows",
+                            "podcasts": "Podcasts",
+                            "myVideos": "My Videos",
+                            "history": "History",
+                            "watchLater": "Watch Later",
+                            "playlists": "Playlists"
+                        }
+                    },
+                    "nav": {
+                        "search": "Search",
+                        "home": "Home",
+                        "sports": "Sports",
+                        "news": "News",
+                        "music": "Music",
+                        "podcasts": "Podcasts",
+                        "moviesTV": "Movies & TV",
+                        "live": "Live",
+                        "gaming": "Gaming",
+                        "subscriptions": "Subscriptions",
+                        "library": "Library",
+                        "more": "More",
+                        "shorts": "Shorts"
+                    },
+                    "clock": {
+                        "title": "Clock",
+                        "subtitle": "Display a clock on the screen",
+                        "options": {
+                            "enableClock": "Enable Clock",
+                            "isClock12HourFormat": "Use 12-Hour Format for Clock",
+                            "clockShowSeconds": "Show Seconds on Clock",
+                            "clockHideWhenVideoPlaying": "Hide Clock While Video Is Playing"
+                        }
+                    },
+                    "disableEnlargingThumbnails": "Disable Enlarged Thumbnails",
+                    "enableShrinkingThumbnails": "Enable Shrinked Thumbnails",
+                    "hideMembersOnlyVideos": "Hide Members-Only Videos",
+                    "hidePaidVideos": "Hide Paid Videos",
+                    "hideFreeWithAdsVideos": "Hide Free Films With Ads",
+                    "hideAggregateShelf": "Hide the Combined Subscriptions Row",
+                    "hideChannelShelves": "Hide Channel Shelves",
+                    "hideMusicShelf": "Hide the Music Row",
+                    "hideSurveys": "Hide Feedback Surveys",
+                    "sortSidebarContents": {
+                        "title": "Sort Sidebar Contents",
+                        "subtitle": "Change the order of the entries in the sidebar",
+                        "moveUp": {
+                            "title": "Move Up",
+                            "subtitle": "Move this item up in the sidebar"
+                        },
+                        "moveDown": {
+                            "title": "Move Down",
+                            "subtitle": "Move this item down in the sidebar"
+                        },
+                        "addToSidebar": "Add Channel to Sidebar",
+                        "removeFromSidebar": "Remove Channel from Sidebar",
+                        "empty": "No sidebar entries are shown — turn some back on first"
+                    },
+                    "hideDuplicateVideos": "Hide Duplicate Videos",
+                    "hiddenChannels": {
+                        "title": "Hidden Channels",
+                        "subtitle": "Channels hidden from the long press menu",
+                        "unhide": "Select to show this channel again",
+                        "empty": "No channels are hidden"
+                    },
+                    "keywordHider": "Hide Videos by Title Keyword",
+                    "hideViewCounts": "Hide View Counts",
+                    "hideQualityBadges": "Hide 4K/8K and Dubbed Badges",
+                    "returnYoutubeDislike": "Return YouTube Dislike (sends video ids to returnyoutubedislike.com)",
+                    "unwedgePlayer": "Recover a frozen player automatically"
+                }
+            },
+            "updater": {
+                "title": "TizenTube Cobalt Updater",
+                "menuSubtitle": "Manage TizenTube Cobalt updates",
+                "versionSubtitle": "Current version: {{version}}",
+                "options": {
+                    "checkForUpdates": "Check for updates",
+                    "checkForUpdatesOnStartup": "Check for updates on startup"
+                },
+                "updateAvailable": {
+                    "title": "Update Available",
+                    "subtitle": "A new version of TizenTube Cobalt is available: {{latestVersion}}, current: {{currentVersion}}"
+                },
+                "releaseDate": "Release Date: {{date}}",
+                "updateNow": {
+                    "title": "Update Now",
+                    "subtitle": "Click to download the latest version."
+                },
+                "remindLater": {
+                    "title": "Remind Me Later",
+                    "subtitle": "Check for updates later."
+                },
+                "upToDate": {
+                    "title": "TizenTube is up to date",
+                    "subtitle": "You are using the latest version ({{version}}) of TizenTube Cobalt."
+                },
+                "checkFailed": {
+                    "title": "TizenTube update check failed",
+                    "subtitle": "Could not check for updates."
+                },
+                "downloading": {
+                    "title": "TizenTube Update",
+                    "subtitle": "Downloading update, please wait..."
+                }
+            }
+        },
+        "ttSettings": {
+            "title": "TizenTube Settings",
+            "madeByText": "Made by Reis Can (reisxd) with ❤️",
+            "versionInfo": {
+                "standalone": "Standalone {{standaloneVersion}} · Module {{moduleVersion}}",
+                "module": "Module {{moduleVersion}}"
+            },
+            "summary": "Open TizenTube Settings",
+            "version": "Version: {{version}}"
+        },
+        "supportTT": {
+            "title": "Support TizenTube",
+            "subtitle": "❤️ Show support for TizenTube and its development",
+            "content": {
+                "1": "If you enjoy using TizenTube and would like to support its development, consider the following:",
+                "2": "1. Star the GitHub repository to help increase its visibility.",
+                "3": "2. Share TizenTube with others.",
+                "4": "If you would like to contribute financially, consider donating:",
+                "5": "- Buy Me A Coffee: https://www.buymeacoffee.com/reisxd (preferably)",
+                "6": "- GitHub Sponsors: https://github.com/sponsors/reisxd"
+            }
+        },
+        "numericEditor": {
+            "hint": "Left/Right move · Up/Down change · number keys type · continue right for Save",
+            "save": "Save",
+            "cancel": "Cancel",
+            "saved": "Saved: {{value}}"
+        }
+    },
+    "playlist": {
+        "allHidden": "All videos in this playlist are hidden. Leave playlist to dismiss.",
+        "continue": "Continue"
+    },
+    "welcomeMsg": {
+        "title": "Welcome to TizenTube",
+        "subtitle": "Go to settings and click on TizenTube Settings for settings."
+    },
+    "sponsorblock": {
+        "segments": {
+            "sponsor": "sponsored segment",
+            "intro": "intro",
+            "outro": "outro",
+            "interaction": "interaction reminder",
+            "selfpromo": "self-promotion",
+            "preview": "recap or preview",
+            "filler": "tangents",
+            "music_offtopic": "non-music part",
+            "poi_highlight": "highlight"
+        },
+        "toasts": {
+            "skipping": "Skipping {{segment}}",
+            "notSkipping": "Not skipping {{segment}} (was skipped {{count}} times)",
+            "skip": "Skip {{segment}}",
+            "skipToHighlight": "Skip to highlight"
+        }
+    },
+    "player": {
+        "playbackSpeed": {
+            "title": "Playback Speed",
+            "button": "Speed Controls"
+        },
+        "miniPlayer": "Mini Player",
+        "screenOff": "Screen Off",
+        "pictureInPicture": "Picture in Picture",
+        "previous": "Previous",
+        "next": "Next",
+        "withTizenTube": "with TizenTube",
+        "share": {
+            "title": "Share",
+            "button": "Share",
+            "qrCodeScanMessage": "Scan the QR code below to share this video."
+        },
+        "playlistEnd": {
+            "title": "End of playlist",
+            "cancel": "Cancel",
+            "paused": "Nothing else will play",
+            "replay": "Play this video again"
+        }
+    },
+    "videoMenu": {
+        "play": "Play",
+        "watchLater": "Save to Watch Later",
+        "removeFromWatchLater": "Remove from Watch Later",
+        "savePlaylist": "Save to Playlist",
+        "addToQueue": "Add to Queue",
+        "goToChannel": "Go To Channel",
+        "yourPlaylists": "Your Playlists",
+        "addToNamedPlaylist": "Save to {{name}}",
+        "notInterested": "Not interested",
+        "dontRecommendChannel": "Don't recommend channel",
+        "share": "Share (QR Code)",
+        "playNext": "Play Next",
+        "removeFromPlaylist": "Remove From This Playlist",
+        "hideChannel": "Hide This Channel",
+        "showWatchedPlaylist": "Show Watched Videos In This Playlist",
+        "hideWatchedPlaylistAgain": "Hide Watched Videos In This Playlist Again",
+        "showWatchedChannelPage": "Show Watched Videos On This Channel",
+        "hideWatchedChannelPageAgain": "Hide Watched Videos On This Channel Again",
+        "showWatchedChannelEverywhere": "Show This Channel’s Watched Videos Elsewhere",
+        "hideWatchedChannelEverywhereAgain": "Hide This Channel’s Watched Videos Elsewhere Again",
+        "playlistMenuSubtitle": "Playlist",
+        "channelMenuSubtitle": "Channel",
+        "markWatched": "Mark As Watched",
+        "playPlaylist": "Play Playlist"
+    },
+    "toasts": {
+        "feedbackSent": "Feedback sent.",
+        "feedbackFailed": "Could not send the feedback.",
+        "downloadingUpdate": "Downloading update, please wait...",
+        "videoAddedToQueue": "Video added to queue.",
+        "videoQueueCleared": "Video queue cleared.",
+        "shareNoVideo": "No video is currently playing.",
+        "shareFailed": "Could not create the QR code.",
+        "sidebarContentsUpdated": {
+            "title": "Sidebar updated",
+            "subtitle": "Restart the app if the sidebar does not refresh."
+        },
+        "sidebarGuideFetchFailed": "Could not load the sidebar entries. Try again in a moment.",
+        "networkWaiting": "Waiting for the network… ({{seconds}}s)",
+        "networkBack": "The network is back.",
+        "networkBackReloading": "The network is back, reloading the page…",
+        "networkStillOffline": "Still no network. The page will reload as soon as it is back.",
+        "networkContinuingAnyway": "Still no network, starting anyway…",
+        "videoPlaysNext": "Video plays next.",
+        "channelHidden": "“{{name}}” is now hidden.",
+        "channelShownAgain": "“{{name}}” is shown again.",
+        "channelHideFailed": "This tile does not say which channel it belongs to.",
+        "savedToPlaylist": "Saved to “{{name}}”.",
+        "saveToPlaylistFailed": "Could not save to “{{name}}”.",
+        "hideWatchedPlaylistExempt": "Watched videos stay visible in this playlist.",
+        "hideWatchedPlaylistHidingAgain": "Watched videos are hidden in this playlist again.",
+        "hideWatchedChannelPageExempt": "Watched videos stay visible on this channel’s page.",
+        "hideWatchedChannelPageHidingAgain": "Watched videos are hidden on this channel’s page again.",
+        "hideWatchedChannelExempt": "“{{name}}” keeps its watched videos outside its own page.",
+        "hideWatchedChannelHidingAgain": "“{{name}}” has its watched videos hidden again outside its own page.",
+        "hideWatchedExemptionRemoved": "“{{name}}” hides watched videos again.",
+        "markWatchedWorking": "Telling YouTube this has been watched…",
+        "markWatchedOnAccount": "Marked as watched on your account — it will be watched on other devices too.",
+        "markWatchedFailed": "YouTube would not accept this, so nothing was hidden — it stays as it is here and on your other devices."
+    },
+    "general": {
+        "dislikes": "Dislikes",
+        "countSuffix": {
+            "thousand": "K",
+            "million": "M",
+            "billion": "B"
+        }
+    }
+}

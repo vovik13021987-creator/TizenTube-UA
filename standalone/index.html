@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+
+<head>
+    <style>
+        @keyframes indeterminate-bar {
+            0% {
+                left: 0%;
+                width: 0;
+            }
+
+            50% {
+                left: 0%;
+                width: 100%;
+            }
+
+            100% {
+                left: 100%;
+                width: 0;
+            }
+        }
+
+        .progress-container {
+            position: relative;
+            width: 300px;
+            height: 4px;
+            margin-top: 40px;
+            background-color: rgba(25, 118, 210, 0.3);
+            border-radius: 2px;
+            overflow: hidden;
+        }
+
+        .progress-bar {
+            position: absolute;
+            top: 0;
+            left: 0;
+            height: 100%;
+            background-color: #1976D2;
+            animation: indeterminate-bar 1.5s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+        }
+    </style>
+    <script>
+        "use strict";
+
+        // Earliest possible diagnostic hook — runs before the service is even
+        // launched, so it can catch failures the service's own self-logging
+        // never gets a chance to (e.g. launchAppControl's callback never
+        // firing at all). Same /tv-log target and payload shape as the
+        // service's own relayLog, so scripts/log-receiver/receiver.ps1 needs
+        // no changes.
+        // No address is written down here any more. index.html cannot read the
+        // page's settings — those live in localStorage on a different origin —
+        // so instead of carrying a constant it hands its lines to the service,
+        // which knows the receiver the user configured in the settings menu and
+        // persists it across restarts.
+        //
+        // The service is not listening yet when the first lines are produced, so
+        // they are buffered and flushed as soon as it answers. Bounded, because
+        // a service that never comes up must not grow this forever.
+        var MAX_BUFFERED_LOGS = 100;
+        var bufferedLogs = [];
+
+        // Every line above goes to the service, which means a service that never
+        // answers takes the account of its own failure with it — the reason the
+        // 6.5 failure has no capture. These breadcrumbs go to this page's own
+        // localStorage instead, which needs nothing and no one, and are handed
+        // over the next time the service does answer. So a start that dies
+        // silently is read back on the next start that works.
+        //
+        // This page's origin is the widget's own, so this storage is private to
+        // it and survives the TV being switched off. Reinstalling clears it,
+        // which is worth knowing: reinstall after a failure and the breadcrumbs
+        // go with it.
+        var BREADCRUMB_KEY = 'ttStartupBreadcrumbs';
+        var MAX_BREADCRUMBS = 40;
+        var startedAt = Date.now();
+
+        function breadcrumb(stage, detail) {
+            try {
+                var all = [];
+                try { all = JSON.parse(window.localStorage.getItem(BREADCRUMB_KEY) || '[]'); } catch (e) { all = []; }
+                if (!(all instanceof Array)) all = [];
+                all.push({ ts: new Date().toISOString(), at: Date.now() - startedAt, stage: String(stage), detail: detail === undefined ? null : detail });
+                while (all.length > MAX_BREADCRUMBS) all.shift();
+                window.localStorage.setItem(BREADCRUMB_KEY, JSON.stringify(all));
+            } catch (e) { }
+        }
+
+        // Stages a start is meant to end at.
+        var TERMINAL_STAGES = ['cdp-handoff', 'proxy-nav'];
+
+        // Below this, a start that stopped short of a decision is the platform
+        // replacing the page, not a fault.
+        //
+        // This read "DIED AT" for any start that did not reach a terminal
+        // stage, and a capture showed why that is too eager: a start lasting
+        // 741ms and ending at health-ok, twice, in the same minute as one that
+        // reached cdp-handoff. That is the documented auto-relaunch — the app
+        // hands off, exits, and Tizen starts the launcher again — so the run
+        // ends before any decision is recorded and nothing is wrong. Calling
+        // that a death would bury the real hang, which sits for minutes.
+        var SHORT_START_MS = 10000;
+
+        function reportPreviousStart() {
+            try {
+                var all = [];
+                try { all = JSON.parse(window.localStorage.getItem(BREADCRUMB_KEY) || '[]'); } catch (e) { return; }
+                if (!(all instanceof Array) || !all.length) return;
+                window.localStorage.removeItem(BREADCRUMB_KEY);
+                var last = all[all.length - 1];
+                var trail = ', ' + all.length + ' stages: ' + JSON.stringify(all);
+                if (TERMINAL_STAGES.indexOf(last.stage) !== -1) {
+                    sendLog('INFO', 'previous start reached "' + last.stage + '" after ' + last.at + 'ms ('
+                        + last.ts + ')' + trail);
+                    return;
+                }
+                if (last.at < SHORT_START_MS) {
+                    sendLog('INFO', 'previous start ended at "' + last.stage + '" after only ' + last.at
+                        + 'ms (' + last.ts + '), which is the app being relaunched rather than a fault' + trail);
+                    return;
+                }
+                sendLog('ERROR', 'previous start STALLED AT "' + last.stage + '" for ' + last.at + 'ms ('
+                    + last.ts + ') without reaching a decision' + trail);
+            } catch (e) { }
+        }
+
+        // The service's own account of itself: uptime above all, which says
+        // whether this start is talking to a fresh process or to one that has
+        // been up for days. A request that never comes back is the finding.
+        function reportServiceHealth() {
+            var asked = Date.now();
+            var settled = false;
+            try {
+                var timer = setTimeout(function () {
+                    if (settled) return;
+                    settled = true;
+                    breadcrumb('health-timeout');
+                    sendLog('ERROR', 'health did not answer within 3000ms - the service holds the port but is not serving');
+                }, 3000);
+                fetch('http://localhost:8099/tizentube/health')
+                    .then(function (r) { return r.json(); })
+                    .then(function (h) {
+                        if (settled) return;
+                        settled = true;
+                        clearTimeout(timer);
+                        breadcrumb('health-ok', h.uptimeSec);
+                        sendLog('INFO', 'service health after ' + (Date.now() - asked) + 'ms: ' + JSON.stringify(h));
+                    })
+                    .catch(function (e) {
+                        if (settled) return;
+                        settled = true;
+                        clearTimeout(timer);
+                        breadcrumb('health-unreachable');
+                        sendLog('INFO', 'health unreachable (normal before the service is up): ' + (e && e.message || e));
+                    });
+            } catch (e) { }
+        }
+
+        function postLog(entry) {
+            return fetch('http://localhost:8099/tizentube/log', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ entry: entry })
+            });
+        }
+
+        function flushBufferedLogs() {
+            if (!bufferedLogs.length) return;
+            var pending = bufferedLogs.splice(0, bufferedLogs.length);
+            for (var i = 0; i < pending.length; i++) {
+                (function (entry) {
+                    try {
+                        postLog(entry).catch(function () { });
+                    } catch (e) { }
+                })(pending[i]);
+            }
+        }
+
+        function sendLog(level, message) {
+            var ts = new Date().toISOString();
+            var entry = {
+                _formatted: '[' + ts + '] [' + level + '] [StandaloneIndexHtml] ' + message,
+                app: 'TizenTube Standalone',
+                ts: ts,
+                level: level,
+                context: 'StandaloneIndexHtml',
+                message: message
+            };
+            try {
+                postLog(entry).then(function () {
+                    flushBufferedLogs();
+                }).catch(function () {
+                    if (bufferedLogs.length < MAX_BUFFERED_LOGS) bufferedLogs.push(entry);
+                });
+            } catch (e) {
+                if (bufferedLogs.length < MAX_BUFFERED_LOGS) bufferedLogs.push(entry);
+            }
+        }
+
+        sendLog('INFO', 'index.html script started');
+        reportPreviousStart();
+        breadcrumb('script-started');
+
+        tizen.tvinputdevice.registerKey("ColorF0Red");
+        tizen.tvinputdevice.registerKey("ColorF1Green");
+        tizen.tvinputdevice.registerKey("ColorF2Yellow");
+        tizen.tvinputdevice.registerKey("ColorF3Blue");
+
+        const keys = [
+            "MediaPlayPause",
+            "MediaPlay",
+            "MediaPause",
+            "MediaStop",
+            "MediaFastForward",
+            "MediaRewind",
+            "MediaTrackNext",
+            "MediaTrackPrevious"
+        ];
+
+        for (let i = 0; i < keys.length; i++) {
+            tizen.tvinputdevice.registerKey(keys[i]);
+        }
+
+        const pkgId = tizen.application.getCurrentApplication().appInfo.packageId;
+
+        const serviceId = pkgId + ".StandaloneService";
+
+        // Bounds the isConnecting poll below. Waiting is preferred over the proxy
+        // path — the proxy rewrites YouTube's traffic, which is confirmed to
+        // trigger verification challenges that stop playback (see README) — but
+        // waiting forever is how a wedged isConnecting became a permanent splash
+        // screen. Roughly 30s of patience, then take the degraded path rather
+        // than none at all.
+        var MAX_CONNECTING_POLLS = 30;
+        var connectingPolls = 0;
+
+        // The service needs roughly three seconds to listen; these cover that
+        // without restarting the page underneath it.
+        var MAX_STARTUP_RETRIES = 20;
+        var STARTUP_RETRY_MS = 300;
+        var startupRetries = 0;
+
+        function useInjectorOrProxy() {
+            sendLog('INFO', 'useInjectorOrProxy() called, fetching getState');
+            const data = tizen.application.getCurrentApplication().getRequestedAppControl().appControl.data;
+            let args;
+            try {
+                const parsedData = JSON.parse(data[0].value[0]);
+                args = parsedData.args;
+            } catch (e) {
+                // Do nothing.
+            }
+            fetch('http://localhost:8099/tizentube/getState')
+                .then(r => r.json())
+                .then(res => {
+                    sendLog('INFO', 'getState resolved: ' + JSON.stringify(res));
+                    if (res.canConnectToDaemon && !res.isConnecting) {
+                        sendLog('INFO', 'Taking CDP-injection path, launching debugger and exiting');
+                        breadcrumb('cdp-handoff');
+                        fetch(`http://localhost:8099/tizentube/debugger${args ? `?${args}` : ''}`);
+                        tizen.application.getCurrentApplication().exit();
+                    } else if (!res.canConnectToDaemon) {
+                        sendLog('INFO', 'Taking proxy path, navigating to localhost:8099/tv');
+                        breadcrumb('proxy-nav');
+                        location.href = `http://localhost:8099/tv?additionalDataUrl=http%3A%2F%2Flocalhost%3A8095%2Fdial%2Fapps%2FYouTube${args ? `&${args}` : ''}`
+                    } else if (connectingPolls < MAX_CONNECTING_POLLS) {
+                        // canConnectToDaemon && isConnecting: a connection attempt is
+                        // (or was) already in progress. Neither branch above matched,
+                        // so previously this silently did nothing — a permanent hang
+                        // whenever isConnecting got stuck true (e.g. a previous CDP
+                        // attempt that never completed or failed, confirmed on-device).
+                        // Poll rather than give up: injector.js times out a stuck
+                        // attempt, so the usual outcome is the preferred CDP path.
+                        connectingPolls++;
+                        sendLog('INFO', 'canConnectToDaemon but isConnecting, retrying in 1s (' + connectingPolls + '/' + MAX_CONNECTING_POLLS + ')');
+                        setTimeout(useInjectorOrProxy, 1000);
+                    } else {
+                        // Out of patience. isConnecting has stayed true well past
+                        // injector.js's own give-up point, so nothing is coming —
+                        // fall back to the proxy instead of sitting on the splash
+                        // screen indefinitely, which is what this state used to do.
+                        sendLog('ERROR', 'isConnecting still true after ' + MAX_CONNECTING_POLLS + ' polls, falling back to proxy path');
+                        breadcrumb('proxy-nav', 'after isConnecting gave up');
+                        location.href = `http://localhost:8099/tv?additionalDataUrl=http%3A%2F%2Flocalhost%3A8095%2Fdial%2Fapps%2FYouTube${args ? `&${args}` : ''}`
+                    }
+                }).catch((err) => {
+                    // The service takes a couple of seconds to come up, and every
+                    // getState during that window fails. Reloading the whole page
+                    // for each one restarted launchAppControl too, producing 16
+                    // reloads in 3 seconds on a 6.5 capture — wasted work that
+                    // shows up as a long wait on the loading screen. Retry just
+                    // the fetch instead, and only fall back to a reload once it
+                    // is clear the service is not merely slow to start.
+                    startupRetries++;
+                    if (startupRetries <= MAX_STARTUP_RETRIES) {
+                        sendLog('INFO', 'getState not up yet, retrying in ' + STARTUP_RETRY_MS + 'ms (' + startupRetries + '/' + MAX_STARTUP_RETRIES + ')');
+                        setTimeout(useInjectorOrProxy, STARTUP_RETRY_MS);
+                        return;
+                    }
+                    sendLog('ERROR', 'getState still failing after ' + MAX_STARTUP_RETRIES + ' retries, reloading: ' + (err && err.message || err));
+                    breadcrumb('getState-gave-up', String(err && err.message || err));
+                    window.location.reload();
+                });
+        }
+
+        // Reported on Tizen 6.5: powering the TV on sometimes lands on the
+        // webview's own error page (ERR_INTERNET_DISCONNECTED) instead of
+        // YouTube. Chromium raises that when it believes the device is offline,
+        // so a navigation went out before the network had come back from
+        // standby. Both paths below navigate to YouTube almost at once, so hold
+        // them until the network is really there.
+        //
+        // Deliberately a no-op on a normal launch: if the browser already
+        // reports a link at the first check, this proceeds immediately without
+        // probing anything. The probe only runs when the app starts offline,
+        // which is the case being fixed — so even a probe that misbehaved on
+        // some firmware could never slow down an ordinary start.
+        var NETWORK_WAIT_MAX_MS = 60000;
+        var NETWORK_PROBE_TIMEOUT_MS = 4000;
+
+        // Shown under the progress bar while waiting, so a long wait reads as
+        // "waiting for the network" rather than a hung splash screen.
+        //
+        // This page cannot use the translation files: they are bundled into the
+        // userscript, which has not loaded yet. These mirror
+        // toasts.networkWaiting and toasts.networkContinuingAnyway in
+        // mods/translations/resources/en.json and de.json — keep them in step.
+        // Escapes rather than literal characters, because this page declares no
+        // charset and a literal ellipsis or umlaut could render garbled.
+        var STATUS_TEXT = {
+            en: {
+                waiting: 'Waiting for the network\u2026 ({s}s)',
+                continuing: 'Still no network, starting anyway\u2026',
+                dns: 'Network is up but names cannot be resolved (DNS). Waiting\u2026 ({s}s)'
+            },
+            de: {
+                waiting: 'Warte auf das Netzwerk\u2026 ({s}s)',
+                continuing: 'Immer noch kein Netzwerk, starte trotzdem\u2026',
+                dns: 'Netzwerk da, aber Namen k\u00f6nnen nicht aufgel\u00f6st werden (DNS). Warte\u2026 ({s}s)'
+            }
+        };
+
+        function setStatus(key, seconds) {
+            try {
+                var el = document.getElementById('tt-status');
+                if (!el) return;
+                // null clears it, which is how a wait that ended removes its
+                // own line instead of leaving a number frozen on screen.
+                if (!key) { el.textContent = ''; return; }
+                var lang = String(navigator.language || 'en').toLowerCase().indexOf('de') === 0 ? 'de' : 'en';
+                el.textContent = STATUS_TEXT[lang][key].replace('{s}', String(seconds || 0));
+            } catch (e) { }
+        }
+
+        // Whether the link is up but names cannot be resolved.
+        //
+        // Captured on the 6.5: a video froze with its buffer drained to zero
+        // while the page itself kept running, every page then failed, and a
+        // restart landed on the webview's own error page reading
+        // ERR_NAME_NOT_RESOLVED with an untranslated Tizen string id. The TV
+        // had lost DNS. navigator.onLine stays true for that — the link is
+        // there — so the check below was skipped and this page handed over to
+        // YouTube, which could only fail.
+        //
+        // An address needs no resolving, so a probe to one tells the two apart:
+        // if the IP answers and the name does not, it is DNS, and that has a
+        // specific remedy (a static DNS server on the TV or in the router)
+        // which "no network" does not.
+        var DNS_PROBE_URL = 'http://1.1.1.1/';
+        var DNS_PROBE_TIMEOUT_MS = 3000;
+
+        function probeByAddress(whenDone) {
+            var settled = false;
+            function finish(reachable) {
+                if (settled) return;
+                settled = true;
+                whenDone(reachable);
+            }
+            try {
+                var timer = setTimeout(function () { finish(false); }, DNS_PROBE_TIMEOUT_MS);
+                fetch(DNS_PROBE_URL, { mode: 'no-cors', cache: 'no-store' })
+                    .then(function () { clearTimeout(timer); finish(true); })
+                    .catch(function () { clearTimeout(timer); finish(false); });
+            } catch (e) {
+                finish(false);
+            }
+        }
+
+        // How long a wait has to last before it is worth putting on screen.
+        //
+        // Reported: a network label with "0s" appeared on every start and on
+        // every resume, and never showed anything but 0s. Both halves were one
+        // mistake of mine — the early return below went missing when the DNS
+        // probe was added, so every start entered this wait, announced itself,
+        // and then handed over a moment later with the counter never having
+        // been updated.
+        //
+        // Nothing is shown now until the wait has actually lasted, and while
+        // it lasts the number is ticked every second rather than only when an
+        // attempt happens to end.
+        var STATUS_AFTER_MS = 2000;
+        var statusTicker = null;
+
+        function stopStatusTicker() {
+            if (statusTicker === null) return;
+            clearInterval(statusTicker);
+            statusTicker = null;
+            setStatus(null);
+        }
+
+        function waitForNetworkThen(next) {
+            var started = Date.now();
+            var attempts = 0;
+            var delay = 1000;
+            // Set once the address answers while the name does not.
+            var looksLikeDns = false;
+
+            // The ordinary case: the link is there, so there is nothing to
+            // wait for, nothing to say, and nothing to probe. Deliberately
+            // before everything else — a check that misbehaved on some
+            // firmware must not be able to slow down a normal start.
+            if (navigator.onLine !== false) {
+                next();
+                return;
+            }
+
+            // On screen this is "Warte auf das Netzwerk…", which is what a
+            // stalled start looks like to the user, so the trail says whether
+            // it was waiting and for how long.
+            breadcrumb('network-wait');
+            sendLog('INFO', 'Started offline, waiting for the network before loading YouTube');
+            statusTicker = setInterval(function () {
+                var waited = Date.now() - started;
+                if (waited < STATUS_AFTER_MS) return;
+                setStatus(looksLikeDns ? 'dns' : 'waiting', Math.round(waited / 1000));
+            }, 1000);
+
+            function retry(reason) {
+                if (Date.now() - started >= NETWORK_WAIT_MAX_MS) {
+                    // Past this point waiting further is not helping; proceed and
+                    // let the existing paths do what they did before this check.
+                    sendLog('ERROR', 'Network still not ready after ' + (Date.now() - started) + 'ms (' + reason + '), continuing anyway');
+                    clearInterval(statusTicker);
+                    statusTicker = null;
+                    setStatus('continuing');
+                    next();
+                    return;
+                }
+                if (attempts === 1 || attempts % 5 === 0) {
+                    sendLog('INFO', 'Waiting for network (' + reason + ', attempt ' + attempts + ')');
+                    // Asked once the name probe has failed, and only then: on a
+                    // normal start nothing here runs at all.
+                    probeByAddress(function (reachable) {
+                        if (!reachable || looksLikeDns) return;
+                        looksLikeDns = true;
+                        breadcrumb('dns-failure');
+                        sendLog('ERROR', 'The network is up (' + DNS_PROBE_URL + ' answered) but names cannot be resolved. '
+                            + 'This is DNS, not connectivity: the player starves as its segment hosts stop resolving, and a '
+                            + 'restart lands on ERR_NAME_NOT_RESOLVED. Set a static DNS server on the TV or in the router.');
+                    });
+                }
+                // Whichever comes first — the delay or the link coming back —
+                // runs the next attempt, and cancels the other. Leaving the
+                // listener behind would start a second attempt chain in
+                // parallel, and that one could call next() a second time.
+                var fired = false;
+                function go() {
+                    if (fired) return;
+                    fired = true;
+                    clearTimeout(timer);
+                    window.removeEventListener('online', go);
+                    attempt();
+                }
+                var timer = setTimeout(go, delay);
+                window.addEventListener('online', go);
+                delay = Math.min(Math.round(delay * 1.5), 5000);
+            }
+
+            function attempt() {
+                attempts++;
+                if (navigator.onLine === false) {
+                    retry('navigator.onLine is false');
+                    return;
+                }
+                var finished = false;
+                var timer = setTimeout(function () {
+                    if (finished) return;
+                    finished = true;
+                    retry('probe timed out');
+                }, NETWORK_PROBE_TIMEOUT_MS);
+                // generate_204 answers with an empty 204; no-cors because only
+                // whether it arrives matters, not what it says.
+                fetch('https://www.youtube.com/generate_204?_=' + Date.now(), { mode: 'no-cors', cache: 'no-store', credentials: 'omit' })
+                    .then(function () {
+                        if (finished) return;
+                        finished = true;
+                        clearTimeout(timer);
+                        sendLog('INFO', 'Network ready after ' + (Date.now() - started) + 'ms, ' + attempts + ' check(s)');
+                        breadcrumb('network-ready', Date.now() - started);
+                        stopStatusTicker();
+                        next();
+                    })
+                    .catch(function (e) {
+                        if (finished) return;
+                        finished = true;
+                        clearTimeout(timer);
+                        retry('probe failed: ' + (e && e.message || e));
+                    });
+            }
+
+            attempt();
+        }
+
+        function launchService() {
+            sendLog('INFO', 'Launching StandaloneService via launchAppControl');
+            breadcrumb('launch-service');
+            tizen.application.launchAppControl(
+                new tizen.ApplicationControl("http://tizen.org/appcontrol/operation/service"),
+                serviceId,
+                function () {
+                    sendLog('INFO', 'launchAppControl success callback fired');
+                    breadcrumb('service-launched');
+                    reportServiceHealth();
+                    waitForNetworkThen(useInjectorOrProxy);
+                },
+                function (e) {
+                    // Confirmed on-device: right after a TV reboot, this can
+                    // genuinely fail (Tizen's own service-launch subsystem
+                    // still warming up) — previously just showed an alert
+                    // and stopped, unlike the getState-fetch-failure path
+                    // below which already retries automatically. User had
+                    // to manually close/reopen the app to get past it.
+                    // Retry the same way instead.
+                    breadcrumb('launch-failed', String(e && e.message || e));
+                    sendLog('ERROR', 'launchAppControl failed, retrying in 1s: ' + e.message);
+                    setTimeout(launchService, 1000);
+                }
+            );
+        }
+        launchService();
+    </script>
+</head>
+
+<body
+    style="background-color: #0f0f0f; display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100vh; margin: 0;">
+    <h1
+        style="color: #FFFFFF; font-size: 80px; font-family: Roboto,Noto Sans CJK ZH-HK,Noto Sans Thai,Arial,Helvetica,sans-serif; margin: 0;">
+        TizenTube
+    </h1>
+    <div class="progress-container">
+        <div class="progress-bar"></div>
+    </div>
+    <!-- Filled in by setStatus() while waiting for the network; empty otherwise. -->
+    <div id="tt-status"
+        style="color: #AAAAAA; font-size: 32px; font-family: Roboto,Noto Sans CJK ZH-HK,Noto Sans Thai,Arial,Helvetica,sans-serif; margin-top: 40px; min-height: 40px;">
+    </div>
+</body>
+
+</html>

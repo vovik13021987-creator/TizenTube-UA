@@ -1,0 +1,775 @@
+import { configWrite, configRead } from './config.js';
+import { enablePip } from './features/pictureInPicture.js';
+import modernUI, { optionShow } from './ui/settings.js';
+import { speedSettings } from './ui/speedUI.js';
+import { showToast, buttonItem } from './ui/ytUI.js';
+import checkForUpdates from './features/updater.js';
+import { playlistContinue } from './features/playlistContinue.js';
+import { sendTestPing } from './features/logServer.js';
+import { showNumericEditor, saveNumericEditor, cancelNumericEditor } from './ui/numericEditor.js';
+import { sendSyslogTest } from './features/syslog.js';
+import { screenOff } from './features/screenOff.js';
+import { shareCurrentVideo, shareVideo, sharePlaylist } from './features/qrShare.js';
+import { showBrowseTileMenu } from './ui/browseTileMenu.js';
+import { requestNextAndNavigateChannel, getFeedbackPanelTokens, sendFeedbackToken, addVideoToPlaylist, findFeedbackToken } from './utils/innerTubeCalls.js';
+import showGuideSettings from './ui/sidebarModification.js';
+import showLongPressMenuSettings from './ui/longPressMenuSettings.js';
+import showLongPressPlaylists from './ui/longPressPlaylistSettings.js';
+import showHiddenChannels from './ui/hiddenChannelsSettings.js';
+import showHideWatchedExemptions from './ui/hideWatchedExemptionsSettings.js';
+import { markVideoWatched } from './features/markWatched.js';
+import {
+    toggleChannelNameExemption,
+    toggleChannelPageExemption,
+    togglePlaylistExemption,
+} from './features/hideWatchedExemptions.js';
+import { lockupVideoId } from './features/lockupViewModel.js';
+import { appendFileOnlyLog } from './features/hideWatched.js';
+import { t } from 'i18next';
+
+
+export default function resolveCommand(cmd, _) {
+    // resolveCommand function is pretty OP, it can do from opening modals, changing client settings and way more.
+    // Because the client might change, we should find it first.
+
+    for (const key in window._yttv) {
+        if (window._yttv[key] && window._yttv[key].instance && window._yttv[key].instance.resolveCommand) {
+            return window._yttv[key].instance.resolveCommand(cmd, _);
+        }
+    }
+}
+
+export function findFunction(funcName) {
+    for (const key in window._yttv) {
+        if (window._yttv[key] && window._yttv[key][funcName] && typeof window._yttv[key][funcName] === 'function') {
+            return window._yttv[key][funcName];
+        }
+    }
+}
+
+// Shared with speedUI.js's blue-button remote-log toggle, so both the
+// settings-menu "Test Log Server Connection" button and the shortcut show
+// the same wording for the same outcome.
+export function showLogServerTestToast(result) {
+    // The test now sends whether or not remote logging is enabled, so a
+    // disabled state is no longer a refusal — it just means the ping went out
+    // while ongoing logging stays off. Reported as its own message rather than
+    // the old "enable it first", which made the button useless for its main
+    // job: confirming the host and port before switching logging on.
+    if (!result.queued) {
+        showToast('TizenTube', t('settings.options.misc.options.logServer.testFailed'));
+    } else if (result.enabled) {
+        showToast('TizenTube', t('settings.options.misc.options.logServer.testQueued'));
+    } else {
+        showToast('TizenTube', t('settings.options.misc.options.logServer.testSentButOff'));
+    }
+}
+
+// Patch resolveCommand to be able to change TizenTube settings
+
+// NOTE: mods/features/captionStylePersistence.js also independently wraps
+// window._yttv[key].instance.resolveCommand (its own #patchResolveCommand,
+// polling until _yttv is populated, with its own isPatchedByCaptionPersistence
+// flag). Both wrappers currently compose correctly regardless of which one
+// patches first (each calls through to whatever it captured as "original"),
+// but there's no shared coordination between them — an early return added to
+// either wrapper in the future could silently swallow calls before the
+// other's logic ever runs. Keep that in mind before changing either one.
+export function patchResolveCommand() {
+    for (const key in window._yttv) {
+        if (window._yttv[key] && window._yttv[key].instance && window._yttv[key].instance.resolveCommand) {
+
+            const ogResolve = window._yttv[key].instance.resolveCommand;
+            window._yttv[key].instance.resolveCommand = function (cmd, _) {
+                // Every long press the app opens a menu for comes through
+                // here, which is what makes this the one place that can answer
+                // the question two guesses have now failed to.
+                //
+                // Reported three times: long pressing a playlist in the
+                // library shows nothing. The menus are attached — a capture
+                // has 110 of them — and the enriched diagnostic ruled out both
+                // of my theories: the tiles are TILE_STYLE_YTLR_DEFAULT, the
+                // same style the working video menu uses, with a thumbnail and
+                // one entry. So the attachment is right and the remaining
+                // question is whether the TV fires the gesture at all for a
+                // tile that is not a video.
+                //
+                // This line distinguishes the three possibilities outright:
+                //   nothing logged on a long press  the gesture is never bound
+                //                                   for these tiles, and no
+                //                                   menu we attach can help
+                //   logged with our id present      the menu opens and fails
+                //                                   to draw
+                //   logged without our id           something removes it
+                //                                   between us and the dialog
+                // What the TV did with the hold longPressProbe.js just timed.
+                // Collected into that probe's one summary line rather than
+                // logged per command: a hold followed by a page load resolves
+                // dozens of commands and all we need from them is which kinds
+                // arrived, in order. The probe object lives on the global
+                // because importing it here would close a cycle through
+                // innerTubeCalls.js.
+                const _probe = window.__ttLongPressWindow;
+                if (_probe && _probe.left > 0 && Date.now() < _probe.until) {
+                    _probe.left--;
+                    try {
+                        const keys = Object.keys(cmd || {});
+                        const primary = keys.length ? keys[0] : '?';
+                        const browseId = cmd?.browseEndpoint?.browseId
+                            || cmd?.watchEndpoint?.videoId
+                            || null;
+                        _probe.cmds.push(browseId ? primary + ':' + browseId : primary);
+                        if (cmd?.showMenuCommand) _probe.menu++;
+                    } catch (_) { }
+                }
+                if (cmd?.showMenuCommand) {
+                    try {
+                        const menuItems = cmd.showMenuCommand?.menu?.menuRenderer?.items || [];
+                        appendFileOnlyLog('longPress.menuOpened', {
+                            contentId: cmd.showMenuCommand.contentId || null,
+                            title: cmd.showMenuCommand.title?.simpleText || null,
+                            entries: menuItems.length,
+                            // The tag longPressMenu.js puts on our entries,
+                            // read directly rather than through its
+                            // menuItemId: importing that would close a cycle
+                            // through innerTubeCalls.js, which imports this
+                            // file.
+                            ids: menuItems.map((entry) => (entry && entry.__ttMenuId) || null),
+                            // What the dialog has to draw a header from. An
+                            // empty thumbnail list or a missing title is the
+                            // other way a menu that opens can still show
+                            // nothing, and neither is visible from the
+                            // attachment side.
+                            thumbs: (cmd.showMenuCommand.thumbnail?.thumbnails || []).length,
+                            subtitle: cmd.showMenuCommand.subtitle?.simpleText || null,
+                        });
+                    } catch (_) { }
+                }
+                if (cmd.setClientSettingEndpoint) {
+                    // Command to change client settings. Use TizenTube configuration to change settings.
+                    for (const settings of cmd.setClientSettingEndpoint.settingDatas) {
+                        if (!settings.clientSettingEnum.item.includes('_')) {
+                            for (const setting of cmd.setClientSettingEndpoint.settingDatas) {
+                                const valName = Object.keys(setting).find(key => key.includes('Value'));
+                                const value = valName === 'intValue' ? Number(setting[valName]) : setting[valName];
+                                if (valName === 'arrayValue') {
+                                    const arr = configRead(setting.clientSettingEnum.item);
+                                    if (arr.includes(value)) {
+                                        arr.splice(arr.indexOf(value), 1);
+                                    } else {
+                                        arr.push(value);
+                                    }
+                                    configWrite(setting.clientSettingEnum.item, arr);
+                                } else configWrite(setting.clientSettingEnum.item, value);
+
+                                // Auto-verify the connection the moment Remote
+                                // Logging gets turned on from the settings menu,
+                                // instead of requiring a separate trip to the
+                                // "Test Log Server Connection" button.
+                                if (setting.clientSettingEnum.item === 'logServerEnabled' && value === true) {
+                                    showLogServerTestToast(sendTestPing());
+                                }
+                            }
+                        } else if (settings.clientSettingEnum.item === 'I18N_LANGUAGE') {
+                            const lang = settings.stringValue;
+                            const date = new Date();
+                            date.setFullYear(date.getFullYear() + 10);
+                            document.cookie = `PREF=hl=${lang}; expires=${date.toUTCString()};`;
+                            resolveCommand({
+                                signalAction: {
+                                    signal: 'RELOAD_PAGE'
+                                }
+                            });
+                            return true;
+                        }
+                    }
+                } else if (cmd.customAction) {
+                    customAction(cmd.customAction.action, cmd.customAction.parameters);
+                    return true;
+                } else if (cmd?.signalAction?.customAction) {
+                    customAction(cmd.signalAction.customAction.action, cmd.signalAction.customAction.parameters);
+                    return true;
+                } else if (cmd?.showEngagementPanelEndpoint?.customAction) {
+                    customAction(cmd.showEngagementPanelEndpoint.customAction.action, cmd.showEngagementPanelEndpoint.customAction.parameters);
+                    return true;
+                } else if (cmd?.playlistEditEndpoint?.customAction) {
+                    customAction(cmd.playlistEditEndpoint.customAction.action, cmd.playlistEditEndpoint.customAction.parameters);
+                    return true;
+                } else if (cmd?.openPopupAction?.uniqueId === 'playback-settings') {
+                    // Patch the playback settings popup to use TizenTube speed settings
+                    const items = cmd.openPopupAction.popup.overlaySectionRenderer.overlay.overlayTwoPanelRenderer.actionPanel.overlayPanelRenderer.content.overlayPanelItemListRenderer.items;
+                    for (const item of items) {
+                        // Both names, because YouTube renamed this icon and
+                        // the speed menu stopped being found by the old one
+                        // (upstream 1bf5a67e, reisxd/TizenTube#697). Matching
+                        // either means it keeps working on whichever build of
+                        // the app a TV happens to be served.
+                        const iconType = item?.compactLinkRenderer?.icon?.iconType;
+                        if (iconType === 'SLOW_MOTION_VIDEO' || iconType === 'SPEEDOMETER') {
+                            item.compactLinkRenderer.subtitle && (item.compactLinkRenderer.subtitle.simpleText = t('player.withTizenTube'));
+                            item.compactLinkRenderer.serviceEndpoint = {
+                                clickTrackingParams: "null",
+                                signalAction: {
+                                    customAction: {
+                                        action: 'TT_SPEED_SETTINGS_SHOW',
+                                        parameters: []
+                                    }
+                                }
+                            };
+                        }
+                    }
+
+                    cmd.openPopupAction.popup.overlaySectionRenderer.overlay.overlayTwoPanelRenderer.actionPanel.overlayPanelRenderer.content.overlayPanelItemListRenderer.items.splice(2, 0,
+                        buttonItem(
+                            { title: t('player.miniPlayer') },
+                            { icon: 'CLEAR_COOKIES' }, [
+                            {
+                                customAction: {
+                                    action: 'ENTER_MP'
+                                }
+                            }
+                        ])
+                    );
+                    // Screen off (upstream 8977e23). Also splices at 3, so when PiP is
+                    // available it inserts at 3 afterwards and ends up above this one.
+                    cmd.openPopupAction.popup.overlaySectionRenderer.overlay.overlayTwoPanelRenderer.actionPanel.overlayPanelRenderer.content.overlayPanelItemListRenderer.items.splice(3, 0,
+                        buttonItem(
+                            { title: t('player.screenOff') },
+                            { icon: 'EYE_OFF' }, [
+                            {
+                                customAction: {
+                                    action: 'SCREEN_OFF'
+                                }
+                            }
+                        ])
+                    );
+                    // Share as QR code (upstream 3aa3039). Splices at 3 as well, so
+                    // it lands directly above Screen off.
+                    cmd.openPopupAction.popup.overlaySectionRenderer.overlay.overlayTwoPanelRenderer.actionPanel.overlayPanelRenderer.content.overlayPanelItemListRenderer.items.splice(3, 0,
+                        buttonItem(
+                            { title: t('player.share.button') },
+                            { icon: 'OPEN_IN_NEW' }, [
+                            {
+                                customAction: {
+                                    action: 'SHARE'
+                                }
+                            }
+                        ])
+                    );
+
+                    if (window.h5vcc && window.h5vcc.tizentube && window.h5vcc.tizentube.HasSystemFeature &&
+                        window.h5vcc.tizentube.HasSystemFeature('android.software.picture_in_picture')) {
+                        cmd.openPopupAction.popup.overlaySectionRenderer.overlay.overlayTwoPanelRenderer.actionPanel.overlayPanelRenderer.content.overlayPanelItemListRenderer.items.splice(3, 0,
+                            buttonItem(
+                                { title: t('player.pictureInPicture') },
+                                { icon: 'TV' }, [
+                                {
+                                    customAction: {
+                                        action: 'ENTER_PIP'
+                                    }
+                                },
+                                {
+                                    signalAction: {
+                                        signal: 'POPUP_BACK'
+                                    }
+                                }
+                            ])
+                        );
+                    }
+                } else if (cmd?.watchEndpoint?.videoId) {
+                    // Basic-tier navigation trail: which video was opened, and
+                    // from where. Page changes are already covered by
+                    // page.store in hideWatched.js.
+                    appendFileOnlyLog('nav.video.open', {
+                        videoId: cmd.watchEndpoint.videoId,
+                        page: window.__ttLastDetectedPage || null,
+                        playlistId: cmd.watchEndpoint.playlistId || null,
+                    });
+                    window.isPipPlaying = false;
+                    const ytlrPlayerContainer = document.querySelector('ytlr-player-container');
+                    ytlrPlayerContainer.style.removeProperty('z-index');
+                }
+
+                if (cmd.customAction) return window._yttv[key].instance.resolveCommand(cmd, _);
+
+                if (cmd.commandExecutorCommand && cmd.commandExecutorCommand.commands) {
+                    for (const command of cmd.commandExecutorCommand.commands) {
+                        if (command.customAction) {
+                            customAction(command.customAction.action, command.customAction.parameters);
+                        } else if (command.signalAction?.customAction) {
+                            customAction(command.signalAction.customAction.action, command.signalAction.customAction.parameters);
+                        } else if (command.showEngagementPanelEndpoint?.customAction) {
+                            customAction(command.showEngagementPanelEndpoint.customAction.action, command.showEngagementPanelEndpoint.customAction.parameters);
+                        } else if (command.playlistEditEndpoint?.customAction) {
+                            customAction(command.playlistEditEndpoint.customAction.action, command.playlistEditEndpoint.customAction.parameters);
+                        } else {
+                            window._yttv[key].instance.resolveCommand(command, _);
+                        }
+                    }
+                    return true;
+                }
+
+                if (cmd?.requestAccountSelectorCommand
+                    && cmd.requestAccountSelectorCommand?.identityActionContext?.eventTrigger === 'ACCOUNT_EVENT_TRIGGER_ON_EXIT') {
+                    if (!configRead('enableWhosWatchingMenuOnAppExit')) {
+                        ogResolve.call(this, {
+                            signalAction: {
+                                signal: 'EXIT_APP'
+                            }
+                        });
+                        return false;
+                    }
+                }
+
+                // What the app itself makes of a menu command, which is the
+                // one link in this chain still unobserved.
+                //
+                // From the 20 October capture, long pressing a playlist tile
+                // in the library and a video tile seconds apart on the same
+                // page:
+                //
+                //   playlist  menuOpened {contentId:"VLPLhUcIRiMP5gi…",
+                //               entries:2, ids:["openPlaylist",
+                //               "showWatchedPlaylist"]}
+                //             probe      {menu:1, cmds:["clickTrackingParams"]}
+                //
+                //   video     menuOpened {contentId:"xvojRkY-3Ms", entries:3}
+                //             probe      {menu:1, cmds:["clickTrackingParams",
+                //               "openPopupAction","signalAction",
+                //               "showHintCommand"]}
+                //
+                // So our command arrives intact, with our entries in it, and
+                // for a video the app then resolves openPopupAction — the
+                // thing that actually puts the dialog on screen. For the
+                // playlist it resolves nothing further at all. The menu is
+                // built, dispatched and accepted, and the app's own handler
+                // declines to display it.
+                //
+                // Three ways that can happen and no way yet to tell them
+                // apart: the handler throws, it returns without acting, or it
+                // acts and draws nothing. Only menu commands are wrapped, so
+                // this costs nothing for the thousands of other commands.
+                // A browse tile's menu is ours to draw. The app accepts the
+                // command, returns true and issues no openPopupAction for
+                // these — eight attempts at shaping the command could not
+                // change that, because what it objects to is the tile, and a
+                // command cannot reach that. So this one never goes through.
+                if (cmd?.showMenuCommand?.__ttBrowseTileMenu) {
+                    if (showBrowseTileMenu(cmd)) return true;
+                    // Drawing failed, which should not happen. Let the app
+                    // have it rather than swallow the press entirely.
+                    appendFileOnlyLog('longPress.browseMenuFellBack', {
+                        contentId: cmd.showMenuCommand.contentId || null,
+                    });
+                }
+                if (!cmd?.showMenuCommand) return ogResolve.call(this, cmd, _);
+                try {
+                    const outcome = ogResolve.call(this, cmd, _);
+                    appendFileOnlyLog('longPress.menuHandled', {
+                        contentId: cmd.showMenuCommand.contentId || null,
+                        returned: outcome === undefined ? 'undefined' : String(outcome),
+                        type: typeof outcome,
+                    });
+                    return outcome;
+                } catch (err) {
+                    // Rethrown, so the app behaves exactly as it did before
+                    // this was watched. The point is only to see it.
+                    appendFileOnlyLog('longPress.menuThrew', {
+                        contentId: cmd.showMenuCommand.contentId || null,
+                        msg: String(err?.message || err),
+                        where: String(err?.stack || '').split('\n').slice(0, 3).join(' | '),
+                    });
+                    throw err;
+                }
+            }
+        }
+    }
+}
+
+function customAction(action, parameters) {
+    switch (action) {
+        case 'SETTINGS_UPDATE':
+            modernUI(true, parameters);
+            break;
+        case 'OPTIONS_SHOW':
+            optionShow(parameters, parameters.update);
+            break;
+        case 'SKIP':
+            const kE = document.createEvent('Event');
+            kE.initEvent('keydown', true, true);
+            kE.keyCode = 27;
+            kE.which = 27;
+            document.dispatchEvent(kE);
+
+            document.querySelector('video').currentTime = parameters.time;
+            break;
+        case 'TT_SETTINGS_SHOW':
+            modernUI();
+            break;
+        case 'TT_SPEED_SETTINGS_SHOW':
+            speedSettings();
+            break;
+        case 'UPDATE_REMIND_LATER':
+            configWrite('dontCheckUpdateUntil', parameters);
+            break;
+        case 'UPDATE_DOWNLOAD':
+            window.h5vcc.tizentube.InstallAppFromURL(parameters);
+            showToast('TizenTube Update', t('toasts.downloadingUpdate'));
+            break;
+        case 'SET_PLAYER_SPEED':
+            const speed = Number(parameters);
+            document.querySelector('video').playbackRate = speed;
+            break;
+        case 'SCREEN_OFF':
+            screenOff();
+            break;
+        case 'ENTER_MP':
+            enablePip();
+            break;
+        case 'ENTER_PIP':
+            window.h5vcc.tizentube.EnterPIP();
+            break;
+        case 'SHOW_TOAST':
+            showToast('TizenTube', parameters);
+            break;
+        case 'ADD_TO_QUEUE':
+            window.queuedVideos.videos.push(parameters);
+            showToast('TizenTube', t('toasts.videoAddedToQueue'));
+            break;
+        case 'PLAY_NEXT':
+            playNext(parameters);
+            break;
+        case 'CLEAR_QUEUE':
+            window.queuedVideos.videos = [];
+            showToast('TizenTube', t('toasts.videoQueueCleared'));
+            break;
+        case 'CHECK_FOR_UPDATES':
+            checkForUpdates(true);
+            break;
+        case 'PLAYLIST_CONTINUE':
+            playlistContinue(resolveCommand, showToast);
+            break;
+        case 'SHARE':
+            shareCurrentVideo();
+            break;
+        case 'NOT_INTERESTED':
+            markFeedback(parameters, 0, false);
+            break;
+        case 'DONT_RECOMMEND_CHANNEL':
+            markFeedback(parameters, 1, true);
+            break;
+        case 'FEEDBACK_REASON':
+            sendFeedbackToken(parameters.token)
+                .then(() => {
+                    resolveCommand({ signalAction: { signal: 'POPUP_BACK' } });
+                    showToast('TizenTube', t('toasts.feedbackSent'));
+                })
+                .catch((err) => {
+                    console.warn('TizenTube: failed to send feedback:', err);
+                    showToast('TizenTube', t('toasts.feedbackFailed'));
+                });
+            break;
+        case 'SHARE_VIDEO':
+            shareVideo(parameters?.videoId);
+            break;
+        case 'SHARE_PLAYLIST':
+            sharePlaylist(parameters?.playlistId);
+            break;
+        case 'HIDE_CHANNEL': {
+            const name = String(parameters?.name || '').trim();
+            if (!name) {
+                // Nothing on the tile said which channel it is, so there is
+                // nothing to hide by. Better a toast than silence.
+                showToast('TizenTube', t('toasts.channelHideFailed'));
+                break;
+            }
+            const channels = configRead('hiddenChannels') || [];
+            if (!channels.some(c => String(c).trim().toLowerCase() === name.toLowerCase())) {
+                configWrite('hiddenChannels', channels.concat([name]));
+            }
+            // Keep the module's cross-feed filter, and also ask YouTube to
+            // stop recommending this channel for the signed-in account when
+            // the tile supplied a valid engagement-panel reference. The
+            // account-side action is best-effort; local hiding still works if
+            // YouTube changes its internal panel format.
+            if (parameters?.panelId && parameters?.params) {
+                markFeedback(parameters, 1, false);
+            } else {
+                showToast('TizenTube', t('toasts.channelHidden', { name }));
+            }
+            break;
+        }
+        case 'SHOW_HIDDEN_CHANNELS':
+            showHiddenChannels('hiddenChannels');
+            break;
+        // The three exemptions from hiding watched videos. Each toggles, and
+        // the toast has to say which way it went, so the toggle reports back
+        // whether the thing is now exempt rather than the caller assuming.
+        case 'TOGGLE_HIDE_WATCHED_PLAYLIST': {
+            const nowExempt = togglePlaylistExemption(parameters?.playlistId, parameters?.title);
+            if (nowExempt === null) break;
+            showToast('TizenTube', nowExempt
+                ? t('toasts.hideWatchedPlaylistExempt')
+                : t('toasts.hideWatchedPlaylistHidingAgain'));
+            break;
+        }
+        case 'TOGGLE_HIDE_WATCHED_CHANNEL_PAGE': {
+            const nowExempt = toggleChannelPageExemption(parameters?.browseId, parameters?.title);
+            if (nowExempt === null) break;
+            showToast('TizenTube', nowExempt
+                ? t('toasts.hideWatchedChannelPageExempt')
+                : t('toasts.hideWatchedChannelPageHidingAgain'));
+            break;
+        }
+        case 'TOGGLE_HIDE_WATCHED_CHANNEL': {
+            const name = String(parameters?.name || '').trim();
+            if (!name) {
+                // The same dead end "Hide this channel" guards against: nothing
+                // on the tile said which channel it belongs to.
+                showToast('TizenTube', t('toasts.channelHideFailed'));
+                break;
+            }
+            const nowExempt = toggleChannelNameExemption(name);
+            if (nowExempt === null) break;
+            showToast('TizenTube', nowExempt
+                ? t('toasts.hideWatchedChannelExempt', { name })
+                : t('toasts.hideWatchedChannelHidingAgain', { name }));
+            break;
+        }
+        case 'MARK_WATCHED': {
+            const videoId = parameters?.videoId;
+            if (!videoId) break;
+            // The toast waits for the answer rather than claiming success up
+            // front: whether this reached the account is exactly the thing
+            // worth knowing, since reaching it is the point of the feature.
+            showToast('TizenTube', t('toasts.markWatchedWorking'));
+            markVideoWatched(videoId, parameters?.params).then((how) => {
+                // Two outcomes now, not three: either YouTube took it and the
+                // video is hidden everywhere, or it did not and the video is
+                // hidden nowhere.
+                if (how === 'account') showToast('TizenTube', t('toasts.markWatchedOnAccount'));
+                else showToast('TizenTube', t('toasts.markWatchedFailed'));
+            }, () => showToast('TizenTube', t('toasts.markWatchedFailed')));
+            break;
+        }
+        case 'SHOW_HIDE_WATCHED_EXEMPTIONS':
+            showHideWatchedExemptions('hideWatchedExemptions');
+            break;
+        case 'REMOVE_HIDE_WATCHED_EXEMPTION':
+            showHideWatchedExemptions('REMOVE_HIDE_WATCHED_EXEMPTION', parameters);
+            break;
+        case 'UNHIDE_CHANNEL':
+            showHiddenChannels('UNHIDE_CHANNEL', parameters);
+            break;
+        case 'GO_TO_CHANNEL':
+            requestNextAndNavigateChannel(parameters);
+            break;
+        case 'ADD_TO_PLAYLIST':
+            addVideoToPlaylist(parameters?.playlistId, parameters?.videoId)
+                .then(() => showToast('TizenTube', t('toasts.savedToPlaylist', { name: parameters?.name || '' })))
+                .catch((err) => {
+                    console.warn('TizenTube: could not save to the playlist:', err);
+                    showToast('TizenTube', t('toasts.saveToPlaylistFailed', { name: parameters?.name || '' }));
+                });
+            break;
+        case 'SHOW_LONGPRESS_PLAYLISTS':
+            showLongPressPlaylists('longPressPlaylistIds');
+            break;
+        case 'TOGGLE_LONGPRESS_PLAYLIST':
+            showLongPressPlaylists('TOGGLE_LONGPRESS_PLAYLIST', parameters);
+            break;
+        case 'SHOW_LONGPRESS_PLAYLIST_ORDER':
+            showLongPressPlaylists('longPressPlaylistOrder');
+            break;
+        case 'SHOW_LONGPRESS_PLAYLIST_MOVE':
+            showLongPressPlaylists('SHOW_LONGPRESS_PLAYLIST_MOVE', parameters);
+            break;
+        case 'MOVE_LONGPRESS_PLAYLIST':
+            showLongPressPlaylists('MOVE_LONGPRESS_PLAYLIST', parameters);
+            break;
+        case 'SHOW_LONGPRESS_MENU_SETTINGS':
+            showLongPressMenuSettings(parameters);
+            break;
+        case 'SHOW_LONGPRESS_MOVE':
+            showLongPressMenuSettings('SHOW_LONGPRESS_MOVE', parameters);
+            break;
+        case 'MOVE_LONGPRESS_ENTRY':
+            showLongPressMenuSettings('MOVE_LONGPRESS_ENTRY', parameters);
+            break;
+        case 'TOGGLE_LONGPRESS_ENTRY':
+            showLongPressMenuSettings('TOGGLE_LONGPRESS_ENTRY', parameters);
+            break;
+        case 'SHOW_GUIDE_SETTINGS':
+            showGuideSettings(parameters);
+            break;
+        case 'SHOW_GUIDE_BUTTONS':
+            showGuideSettings('SHOW_GUIDE_BUTTONS', parameters);
+            break;
+        case 'MOVE_GUIDE_BUTTON':
+            showGuideSettings('MOVE_GUIDE_BUTTON', parameters);
+            break;
+        case 'TOGGLE_GUIDE_ENTRY':
+            showGuideSettings('TOGGLE_GUIDE_ENTRY', parameters);
+            break;
+        case 'RELOAD_GUIDE_OPTIONS':
+            showGuideSettings(parameters.settingType, true);
+            break;
+        case 'ADD_OR_REMOVE_CHANNEL_TO_SIDEBAR': {
+            const sidebarOrder = configRead('sidebarContentsOrder') || [];
+            const existing = sidebarOrder.findIndex(entry =>
+                (typeof entry === 'object' && entry !== null ? entry.browseId : entry) === parameters.browseId);
+            if (existing !== -1) {
+                sidebarOrder.splice(existing, 1);
+            } else {
+                sidebarOrder.push({ browseId: parameters.browseId, title: parameters.title });
+            }
+            configWrite('sidebarContentsOrder', sidebarOrder);
+            showToast(t('toasts.sidebarContentsUpdated.title'), t('toasts.sidebarContentsUpdated.subtitle'));
+            break;
+        }
+        case 'NUMERIC_EDITOR_SHOW':
+            showNumericEditor(parameters);
+            break;
+        case 'NUMERIC_EDITOR_SAVE':
+            saveNumericEditor();
+            break;
+        case 'NUMERIC_EDITOR_CANCEL':
+            cancelNumericEditor();
+            break;
+        case 'SYSLOG_TEST': {
+            const result = sendSyslogTest();
+            // Mirrors the log server's test: a disabled output is no longer a
+            // refusal, so the outcomes are no-host, failed, sent, and
+            // sent-while-output-is-off.
+            if (result.noHost) showToast('TizenTube', t('settings.options.misc.options.syslog.testNoHost'));
+            else if (!result.queued) showToast('TizenTube', t('settings.options.misc.options.syslog.testFailed'));
+            else if (result.enabled) showToast('TizenTube', t('settings.options.misc.options.syslog.testQueued'));
+            else showToast('TizenTube', t('settings.options.misc.options.syslog.testSentButOff'));
+            break;
+        }
+        case 'LOG_SERVER_TEST_PING': {
+            showLogServerTestToast(sendTestPing());
+            break;
+        }
+    }
+}
+
+// "Not interested" and "Don't recommend channel" (upstream 137ab52d, itself a
+// port of the SmartTube fix). The tokens are no longer in the long press menu;
+// the entry carries an engagement panel reference, the panel is fetched here,
+// and its token is what gets sent. Token order: [0] not interested,
+// [1] don't recommend channel.
+//
+// "Don't recommend channel" may come back with a follow-up asking why; those
+// reasons are shown as a modal and the chosen one is sent as FEEDBACK_REASON.
+async function markFeedback(parameters, tokenIndex, showReasons) {
+    try {
+        const tokens = await getFeedbackPanelTokens(parameters.panelId, parameters.params);
+        const token = tokens[tokenIndex];
+        if (!token) {
+            showToast('TizenTube', t('toasts.feedbackFailed'));
+            return;
+        }
+
+        const response = await sendFeedbackToken(token);
+        if (!showReasons) {
+            showToast('TizenTube', t('toasts.feedbackSent'));
+            return;
+        }
+
+        const dismissal = response?.feedbackResponses?.[0]?.followUpDialog?.dismissalFollowUpRenderer;
+        const reasons = dismissal?.reasons;
+        if (!Array.isArray(reasons) || !reasons.length) {
+            showToast('TizenTube', t('toasts.feedbackSent'));
+            return;
+        }
+
+        // reason.title and reason.token are where these used to be.
+        //
+        // reisxd/TizenTube#720 reports that YouTube now wraps each reason in a
+        // dismissalReasonTextRenderer, with the label under `text` and the
+        // token under feedback.feedbackEndpoint.feedbackToken. Read the old
+        // way, that gives a dialog of blank rows that do nothing when pressed:
+        // extractFeedbackText(undefined) is the empty string, and a
+        // FEEDBACK_REASON carrying token: undefined cannot be sent. Both are
+        // read now, and the token by searching rather than by naming a path —
+        // findFeedbackToken already exists for exactly this, because the shape
+        // has moved before and the panel tokens are found the same way.
+        const readReason = (reason) => {
+            const wrapped = reason && reason.dismissalReasonTextRenderer;
+            const label = extractFeedbackText((wrapped && wrapped.text) || (reason && reason.title));
+            const token = (reason && typeof reason.token === 'string' && reason.token)
+                || findFeedbackToken(reason)
+                || null;
+            return { label, token };
+        };
+
+        const readable = reasons.map(readReason).filter((entry) => entry.label && entry.token);
+        if (readable.length !== reasons.length) {
+            // A row with no label or no token is worse than no row: it is a
+            // dialog that looks like it works. Said out loud so the next shape
+            // change is a line in a capture rather than a silent blank.
+            appendFileOnlyLog('feedback.reasonUnreadable', {
+                reasons: reasons.length,
+                readable: readable.length,
+                keys: reasons.map((reason) => Object.keys(reason || {})[0] || '?'),
+            });
+        }
+        if (!readable.length) {
+            showToast('TizenTube', t('toasts.feedbackSent'));
+            return;
+        }
+
+        const buttons = readable.map((entry) => buttonItem(
+            { title: entry.label },
+            null,
+            [
+                { signalAction: { signal: 'POPUP_BACK' } },
+                { customAction: { action: 'FEEDBACK_REASON', parameters: { token: entry.token } } }
+            ]
+        ));
+        showModal(extractFeedbackText(dismissal.dismissalReasonsPrompt), overlayPanelItemListRenderer(buttons), 'tt-feedback-reasons');
+    } catch (err) {
+        console.warn('TizenTube: failed to mark feedback:', err);
+        showToast('TizenTube', t('toasts.feedbackFailed'));
+    }
+}
+
+// Panel text arrives as simpleText, runs or a plain content string depending on
+// which renderer YouTube used.
+function extractFeedbackText(text) {
+    if (!text) return '';
+    if (text.simpleText) return text.simpleText;
+    if (text.content) return text.content;
+    if (Array.isArray(text.runs)) return text.runs.map((run) => run?.text ?? '').join('');
+    return String(text);
+}
+
+// Put one video next in the queue.
+//
+// Not the front of the list: the queue plays the entry AFTER the one currently
+// playing (see videoQueuing.js), so inserting at the front would only play next
+// when nothing from the queue is playing — which is also exactly when the front
+// IS next, so both cases are covered by anchoring on the current video.
+function playNext(item) {
+    try {
+        const queue = window.queuedVideos?.videos;
+        if (!Array.isArray(queue)) return;
+        const idOf = (v) => v?.tileRenderer?.contentId || lockupVideoId(v) || null;
+        const id = idOf(item);
+
+        // Queue it once. A second copy would also confuse the queue, which
+        // finds the playing video by the FIRST match.
+        const existing = id ? queue.findIndex((v) => idOf(v) === id) : -1;
+        if (existing !== -1) queue.splice(existing, 1);
+
+        const playing = (() => {
+            try { return document.querySelector('.html5-video-player')?.getVideoData?.()?.video_id || null; } catch (_) { return null; }
+        })() || window.queuedVideos.lastVideoId || null;
+        const anchor = playing ? queue.findIndex((v) => idOf(v) === playing) : -1;
+        queue.splice(anchor === -1 ? 0 : anchor + 1, 0, item);
+        showToast('TizenTube', t('toasts.videoPlaysNext'));
+    } catch (err) {
+        console.warn('TizenTube: could not queue the video next:', err);
+    }
+}

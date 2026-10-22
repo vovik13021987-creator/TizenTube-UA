@@ -1,0 +1,229 @@
+// Custom UI for video player
+
+import { extractAssignedFunctions } from "../utils/ASTParser.js";
+import { configRead } from "../config.js";
+import { ButtonRenderer } from "./ytUI.js";
+import { t } from 'i18next';
+import { anyPlayerButtonHidden, filterPlayerButtons } from '../features/playerButtonHider.js';
+
+function applyPatches() {
+    if (!window._yttv) return setTimeout(applyPatches, 250);
+    if (!document.querySelector('video')) return setTimeout(applyPatches, 250);
+    const methods = Object.keys(window._yttv).filter(key => {
+        return typeof window._yttv[key] === 'function' && window._yttv[key].toString().includes('TRANSPORT_CONTROLS_BUTTON_TYPE_FEATURED_ACTION');
+    });
+
+    if (methods.length === 0) {
+        setTimeout(applyPatches, 250);
+        return;
+    }
+
+    const origMethod = window._yttv[methods[0]];
+
+    function YtlrPlayerActionsContainer() {
+        const args = Array.prototype.slice.call(arguments);
+        const isClass = /^class\s/.test(origMethod.toString());
+
+        function constructAsNew(ctor, argsList) {
+            if (typeof Reflect !== 'undefined' && typeof Reflect.construct === 'function') {
+                return Reflect.construct(ctor, argsList, YtlrPlayerActionsContainer);
+            }
+            return new origMethod(...argsList);
+        }
+
+        if (!(this instanceof YtlrPlayerActionsContainer)) {
+            if (isClass) return constructAsNew(origMethod, args);
+            return origMethod.apply(this, args);
+        }
+
+        let inst;
+        if (isClass) {
+            inst = constructAsNew(origMethod, args);
+        } else {
+            origMethod.apply(this, args);
+            inst = this;
+        }
+
+        const functions = extractAssignedFunctions(origMethod.toString());
+
+        const patchingEnabled = configRead('enablePatchingVideoPlayer');
+
+        // Hiding buttons comes first: the lookups below read names out of
+        // minified source and throw when one of them has moved, and this
+        // has to keep working when they do. Wrapping first also puts this
+        // innermost, so the buttons the patches below add are not filtered
+        // — none of them match, but the order makes that moot.
+        if (anyPlayerButtonHidden()) {
+            // The five sit across groups this file only has names for two
+            // of, so every group that deals in transport-control buttons is
+            // wrapped. filterPlayerButtons passes anything that is not a
+            // list of buttons straight through.
+            const groups = [];
+            for (const func of functions) {
+                if (!func.rhs.includes('TRANSPORT_CONTROLS_BUTTON_TYPE') && !func.rhs.includes('engagementActions')) continue;
+                const name = func.left.split('.')[1];
+                if (name && groups.indexOf(name) === -1) groups.push(name);
+            }
+            for (const group of groups) {
+                const origGroup = inst[group];
+                if (typeof origGroup !== 'function') continue;
+                inst[group] = function () {
+                    return filterPlayerButtons(origGroup.apply(this, arguments), group);
+                };
+            }
+        }
+
+        const pipCommand = {
+            "type": "TRANSPORT_CONTROLS_BUTTON_TYPE_PIP",
+            "button": {
+                "buttonRenderer": ButtonRenderer(
+                    false,
+                    configRead('enableSwapMPWithPIP') ? t('player.pictureInPicture') : t('player.miniPlayer'),
+                    'CLEAR_COOKIES',
+                    {
+                        customAction: {
+                            action: configRead('enableSwapMPWithPIP') ? 'ENTER_PIP' : 'ENTER_MP',
+                        }
+                    }
+                )
+            }
+        }
+
+        const settingActionGroup = functions.find(func => {
+            return func.rhs.includes('TRANSPORT_CONTROLS_BUTTON_TYPE_PLAYBACK_SETTINGS');
+        }).left.split('.')[1];
+
+        if (!settingActionGroup) return inst;
+
+        const origSettingActionGroup = inst[settingActionGroup];
+        if (patchingEnabled && configRead('enableMPButton')) {
+            inst[settingActionGroup] = function () {
+                const res = origSettingActionGroup.apply(this, arguments);
+                const idx = res.findIndex(item => item.type === 'TRANSPORT_CONTROLS_BUTTON_TYPE_PLAYBACK_SETTINGS');
+                res.find(item => item.type === 'TRANSPORT_CONTROLS_BUTTON_TYPE_PIP') || res.splice(idx, 0, pipCommand);
+                return res;
+            };
+        }
+
+        const previousButtonName = functions.find(func => {
+            if (func.rhs.includes('skipNextButton')) {
+                const skipNextButtonIndex = func.rhs.indexOf('skipNextButton');
+                const skipPreviousButtonIndex = func.rhs.indexOf('skipPreviousButton');
+                if (skipPreviousButtonIndex > skipNextButtonIndex) {
+                    return true;
+                }
+            }
+        }).left.split('.')[1];
+
+        const nextButtonName = functions.find(func => {
+            if (func.rhs.includes('skipPreviousButton')) {
+                const skipNextButtonIndex = func.rhs.indexOf('skipNextButton');
+                const skipPreviousButtonIndex = func.rhs.indexOf('skipPreviousButton');
+                if (skipNextButtonIndex > skipPreviousButtonIndex) {
+                    return true;
+                }
+            }
+        }).left.split('.')[1];
+
+        const engagementActionButton = functions.find(func => func.rhs.includes('props.data.engagementActions')).left.split('.')[1];
+
+        if (patchingEnabled && engagementActionButton && configRead('enableSpeedControlsButton')) {
+            const origEngagementActionButton = inst[engagementActionButton];
+            inst[engagementActionButton] = function () {
+                const res = origEngagementActionButton.apply(this, arguments);
+                res.find(item => item.type === 'TRANSPORT_CONTROLS_BUTTON_TYPE_SPEED') || res.push({
+                    type: 'TRANSPORT_CONTROLS_BUTTON_TYPE_SPEED',
+                    button: {
+                        buttonRenderer: ButtonRenderer(
+                            false,
+                            t('player.playbackSpeed.button'),
+                            // The current name for this icon; see the matcher
+                            // in resolveCommand.js for why it changed. Unlike
+                            // that one this is a single value and has to pick,
+                            // so it follows upstream and the app as it is now.
+                            'SPEEDOMETER',
+                            {
+                                customAction:
+                                {
+                                    action: 'TT_SPEED_SETTINGS_SHOW',
+                                }
+                            }
+                        )
+                    }
+                });
+                return res;
+            }
+        }
+
+        if (patchingEnabled && !configRead('enableSuperThanksButton')) {
+            const origEngagementActionButton = inst[engagementActionButton];
+            inst[engagementActionButton] = function () {
+                const res = origEngagementActionButton.apply(this, arguments);
+                const superThanksFiltered = res.filter(item => item.type !== 'TRANSPORT_CONTROLS_BUTTON_TYPE_SUPER_THANKS');
+                const shoppingFiltered = superThanksFiltered.filter(item => item.type !== 'TRANSPORT_CONTROLS_BUTTON_TYPE_SHOPPING');
+                return shoppingFiltered;
+            }
+        }
+
+        if (patchingEnabled && !configRead('enableAIAskButton')) {
+            const origEngagementActionButton = inst[engagementActionButton];
+            inst[engagementActionButton] = function () {
+                const res = origEngagementActionButton.apply(this, arguments);
+                return res.filter(item => item.type !== 'TRANSPORT_CONTROLS_BUTTON_TYPE_YOUCHAT_BUTTON');
+            }
+        }
+
+        // Hiding wins over adding: enablePreviousNextButtons puts this fork's
+        // own buttons in those slots, and someone who asked for them gone did
+        // not mean ours instead.
+        const wantPrevious = !configRead('hidePlayerPreviousButton');
+        const wantNext = !configRead('hidePlayerNextButton');
+        if (patchingEnabled && configRead('enablePreviousNextButtons') && (wantPrevious || wantNext)) {
+            if (!previousButtonName || !nextButtonName) return inst;
+            if (wantPrevious) inst[previousButtonName] = function () {
+                return ButtonRenderer(
+                    false,
+                    t('player.previous'),
+                    'SKIP_PREVIOUS',
+                    {
+                        signalAction: {
+                            signal: 'PLAYER_PLAY_PREVIOUS'
+                        }
+                    }
+                )
+            }
+
+            if (wantNext) inst[nextButtonName] = function () {
+                return ButtonRenderer(
+                    false,
+                    t('player.next'),
+                    'SKIP_NEXT',
+                    {
+                        signalAction: {
+                            signal: 'PLAYER_PLAY_NEXT'
+                        }
+                    }
+                )
+            }
+
+        }
+
+        return inst;
+    }
+
+    // Either reason is enough to replace the container. Hiding a player
+    // button has to work for someone who left the rest of the patching off,
+    // and every patch above is gated on its own flag, so nothing else
+    // changes for them.
+    if (configRead('enablePatchingVideoPlayer') || anyPlayerButtonHidden()) {
+        YtlrPlayerActionsContainer.prototype = origMethod.prototype;
+        window._yttv[methods[0]] = YtlrPlayerActionsContainer;
+    }
+}
+
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') {
+    applyPatches();
+} else {
+    window.addEventListener('DOMContentLoaded', applyPatches);
+}

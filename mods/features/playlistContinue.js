@@ -1,0 +1,93 @@
+import { appendFileOnlyLog, hideVideo, getPlaylistButtons, injectPlaylistButton } from './hideWatched.js';
+import { t } from 'i18next';
+
+function _log(label, payload) {
+  appendFileOnlyLog(label, payload);
+}
+
+
+function storePlItems(r) {
+  try {
+    const twoCol = r?.contents?.tvBrowseRenderer?.content?.tvSurfaceContentRenderer?.content?.twoColumnRenderer;
+    const plr = twoCol?.rightColumn?.playlistVideoListRenderer;
+    if (Array.isArray(plr?.contents)) {
+      window.__ttCurrentPlaylistItems = plr.contents.slice();
+      _log('playlist.continue.items.stored', { count: window.__ttCurrentPlaylistItems.length });
+    }
+    const plc = r?.continuationContents?.playlistVideoListContinuation;
+    if (Array.isArray(plc?.contents)) {
+      if (!Array.isArray(window.__ttCurrentPlaylistItems)) window.__ttCurrentPlaylistItems = [];
+      const existingIds = new Set(window.__ttCurrentPlaylistItems.map(i =>
+        i?.tileRenderer?.contentId || i?.tileRenderer?.onSelectCommand?.watchEndpoint?.videoId
+      ).filter(Boolean));
+      const newItems = plc.contents.filter(i => {
+        const id = i?.tileRenderer?.contentId || i?.tileRenderer?.onSelectCommand?.watchEndpoint?.videoId;
+        return !id || !existingIds.has(id);
+      });
+      window.__ttCurrentPlaylistItems = window.__ttCurrentPlaylistItems.concat(newItems);
+      _log('playlist.continue.items.continuation', { total: window.__ttCurrentPlaylistItems.length, added: newItems.length });
+    }
+  } catch (err) {
+    _log('playlist.continue.items.error', { msg: String(err?.message || err) });
+  }
+}
+
+export function playlistContinue(resolveCommandFn, showToastFn) { // showToastFn kept for signature compat
+  try {
+    const raw = window.__ttCurrentPlaylistItems || [];
+    if (!raw.length) {
+      _log('playlist.continue.no_data', {});
+      return;
+    }
+
+    // Re-filter NOW using current _ttVideoProgressCache.
+    // __ttCurrentPlaylistItems was stored when the response arrived; watch progress data
+    // often arrives later via frameworkUpdates mutations. Re-filtering at press time
+    // ensures videos that became "watched" after initial load are excluded.
+    const items = hideVideo(raw, 'playlist');
+    const helperIds = window.__ttPlaylistHelperVideoIds || new Set();
+    const skipped = [];
+
+    for (const item of items) {
+      const cmd = item?.tileRenderer?.onSelectCommand;
+      const videoId = item?.tileRenderer?.contentId || cmd?.watchEndpoint?.videoId;
+      if (!videoId || !cmd) continue;
+
+      if (item?.__ttKeepOneForContinuation || helperIds.has?.(videoId)) {
+        skipped.push(videoId);
+        continue;
+      }
+
+      _log('playlist.continue.play', { videoId, rawItems: raw.length, filteredItems: items.length, skipped: skipped.length });
+      resolveCommandFn(cmd);
+      return;
+    }
+
+    _log('playlist.continue.all_watched.silent', { rawItems: raw.length, filteredItems: items.length, skipped: skipped.length });
+    _log('playlist.continue.none_found', { rawItems: raw.length, filteredItems: items.length, skipped: skipped.length });
+  } catch (err) {
+    _log('playlist.continue.error', { msg: String(err?.message || err) });
+  }
+}
+
+const _origParse = JSON.parse;
+JSON.parse = function () {
+  const r = _origParse.apply(this, arguments);
+  try {
+    const hasPlaylist = !!(r?.contents?.tvBrowseRenderer?.content?.tvSurfaceContentRenderer?.content?.twoColumnRenderer?.rightColumn?.playlistVideoListRenderer);
+    const hasContinuation = !!(r?.continuationContents?.playlistVideoListContinuation);
+    if (hasPlaylist || hasContinuation) {
+      storePlItems(r);
+      if (hasPlaylist) {
+        const buttons = getPlaylistButtons(r);
+        if (buttons) {
+          const injected = injectPlaylistButton(buttons, 'PLAYLIST_CONTINUE', t('playlist.continue'), 'PLAY_ARROW');
+          if (injected) _log('playlist.continue.injected', { totalButtons: buttons.length });
+        }
+      }
+    }
+  } catch (_) {}
+  return r;
+};
+
+window.JSON.parse = JSON.parse;

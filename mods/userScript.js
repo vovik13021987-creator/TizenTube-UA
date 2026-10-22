@@ -1,0 +1,46 @@
+import initStandalonePatches from "./features/standaloneUserscript.js";
+if (window.location.hostname === 'localhost') {
+    initStandalonePatches();
+}
+import "./features/userAgentSpoofing.js";
+import "./features/viewportSpoofing.js";
+import "whatwg-fetch";
+import 'core-js/proposals/object-getownpropertydescriptors';
+
+import './translations/index.js'
+import "./domrect-polyfill";
+import "./features/adblock.js";
+import "./features/sponsorblock.js";
+import "./ui/ui.js";
+import "./ui/speedUI.js";
+import "./ui/theme.js";
+import "./ui/settings.js";
+import "./ui/disableWhosWatching.js";
+import "./features/moreSubtitles.js";
+import "./features/captionStylePersistence.js";
+import "./features/updater.js";
+import "./features/pictureInPicture.js";
+import "./features/preferredVideoQuality.js";
+import "./features/bixbyMicFix.js";
+import "./features/instantSeek.js";
+import "./features/remainingTime.js";
+import "./features/videoQueuing.js";
+import "./features/enableFeatures.js";
+import "./ui/customUI.js";
+import "./ui/customGuideAction.js";
+import "./features/autoFrameRate.js";
+import "./features/visualConsole.js";
+import "./features/playlistContinue.js";
+import "./ui/clock.js";
+import "./features/jumpToPercentage.js";
+import "./features/resumeAfterSuspend.js";
+import "./features/playbackHealth.js";
+import "./features/playbackUnwedge.js";
+// Imported for its side effect: it registers itself with hideWatched.js, which
+// cannot import it back without making a cycle. Nothing is exempt from hiding
+// watched videos until this has run.
+import "./features/hideWatchedExemptions.js";
+import "./features/watchHistory.js";
+import "./features/playerRequestShape.js";
+import "./features/longPressProbe.js";
+import "./ui/sidebarModification.js";
