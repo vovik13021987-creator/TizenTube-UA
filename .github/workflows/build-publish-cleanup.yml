@@ -302,7 +302,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          OLD_VER="$(git show HEAD^:package.json 2>/dev/null | node -e "let s='';process.stdin.on('data',d=>s+=d);process.stdin.on('end',()=>{try{console.log(JSON.parse(s).version||'');}catch{console.log('');}})")"
+          OLD_VER="$( { git show HEAD:package.json 2>/dev/null || true; } | node -e "let s='';process.stdin.on('data',d=>s+=d);process.stdin.on('end',()=>{try{console.log(JSON.parse(s).version||'');}catch{console.log('');}})")"
           NEW_VER="$(node -p "require('./package.json').version")"
 
           if [ -z "${OLD_VER:-}" ]; then
